@@ -1,0 +1,3 @@
+[submodule "udp"]
+	path = udp
+	url = https://github.com/sylw114/udp-audio-server.git

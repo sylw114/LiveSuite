@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Livesuite Pro</title>
+  <style>
+    body { font-family: 'Segoe UI', sans-serif; background: #1e1e1e; color: #eee; padding: 20px; }
+    .card { background: #2d2d2d; padding: 15px; margin-bottom: 20px; border-radius: 8px; }
+    h2 { margin-top: 0; color: #4fc3f7; }
+    input { background: #3c3c3c; border: 1px solid #555; color: white; padding: 5px; border-radius: 4px; }
+    button { padding: 8px 15px; border: none; border-radius: 4px; cursor: pointer; }
+    button:disabled { background: #555; color: #aaa; cursor: not-allowed; }
+    .btn-start { background: #4caf50; color: white; }
+    .btn-stop { background: #f44336; color: white; }
+    #warning { color: #ff9800; font-weight: bold; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h1>Livesuite Control</h1>
+
+  <div class="card">
+    <h2>UDP Audio Server</h2>
+    TCP Port: <input type="number" id="tcpPort" value="9000" min="1" max="65535" style="width: 80px;" oninput="if(this.value.length>5)this.value=this.value.slice(0,5)">
+    UDP Port: <input type="number" id="udpPort" value="9000" min="1" max="65535" style="width: 80px;" oninput="if(this.value.length>5)this.value=this.value.slice(0,5)">
+    <label><input type="checkbox" id="heartbeat" checked> Heartbeat</label>
+    <button onclick="alert('Enabling this option allows the client to receive heartbeats and calculate transmission latency.')">?</button>
+    <label><input type="checkbox" id="discardOrder" checked> Discard Out-of-Order</label>
+    <button onclick="alert('This reduces audio latency. When enabled, audio quality is less affected by packet loss but more sensitive to out-of-order packets. Recommended: Enable this, unless the client is using triple-packet transmission.')">?</button>
+    <br><br>
+    <button id="udpStart" class="btn-start" onclick="startUdp()">Start</button>
+    <button id="udpStop" class="btn-stop" onclick="stopUdp()" disabled>Stop</button>
+    <div id="wasapiAlert" style="margin-top: 15px; padding: 10px; border: 1px solid #ff9800; border-radius: 4px; display: none;"></div>
+  </div>
+
+  <div class="card">
+    <h2>RTMP Server</h2>
+    Port: <input type="number" id="rtmpPort" value="1935" min="1" max="65535" style="width: 80px;" oninput="if(this.value.length>5)this.value=this.value.slice(0,5)">
+    <br><br>
+    <button id="rtmpStart" class="btn-start" onclick="startRtmp()">Start</button>
+    <button id="rtmpStop" class="btn-stop" onclick="stopRtmp()" disabled>Stop</button>
+  </div>
+
+  <div id="warning"></div>
+
+  <script>
+    async function init() {
+      const status = await window.api.getServerStatus();
+      updateUI(status);
+      enforceNumericInputs();
+    }
+    init();
+
+    window.api.onServerStatusChanged(updateUI);
+
+    function enforceNumericInputs() {
+      ['tcpPort', 'udpPort', 'rtmpPort'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) {
+          el.addEventListener('input', (e) => {
+            e.target.value = e.target.value.replace(/\D/g, '');
+          });
+          el.addEventListener('keypress', (e) => {
+            if (!/[0-9]/.test(e.key)) {
+              e.preventDefault();
+            }
+          });
+        }
+      });
+    }
+
+    function updateUI(status) {
+      document.getElementById('udpStart').disabled = status.udpRunning;
+      document.getElementById('udpStop').disabled = !status.udpRunning;
+      document.getElementById('rtmpStart').disabled = status.rtmpRunning;
+      document.getElementById('rtmpStop').disabled = !status.rtmpRunning;
+    }
+
+    async function startUdp() {
+      const tcpPortVal = document.getElementById('tcpPort').value;
+      const udpPortVal = document.getElementById('udpPort').value;
+      const tcpPort = parseInt(tcpPortVal, 10);
+      const udpPort = parseInt(udpPortVal, 10);
+
+      if (isNaN(tcpPort) || tcpPort < 1 || tcpPort > 65535) {
+        document.getElementById('warning').innerText = 'Error: TCP Port must be a valid number between 1 and 65535.';
+        return;
+      }
+      if (isNaN(udpPort) || udpPort < 1 || udpPort > 65535) {
+        document.getElementById('warning').innerText = 'Error: UDP Port must be a valid number between 1 and 65535.';
+        return;
+      }
+      document.getElementById('warning').innerText = '';
+
+      try {
+        await window.api.startUdpServer({
+          tcpPort: tcpPort,
+          udpPort: udpPort,
+          heartbeat: document.getElementById('heartbeat').checked,
+          discardOutOfOrder: document.getElementById('discardOrder').checked
+        });
+      } catch (err) {
+        document.getElementById('warning').innerText = 'Error: ' + err.message;
+      }
+    }
+    function stopUdp() { window.api.stopUdpServer(); }
+    async function startRtmp() {
+      const rtmpPortVal = document.getElementById('rtmpPort').value;
+      const rtmpPort = parseInt(rtmpPortVal, 10);
+
+      if (isNaN(rtmpPort) || rtmpPort < 1 || rtmpPort > 65535) {
+        document.getElementById('warning').innerText = 'Error: RTMP Port must be a valid number between 1 and 65535.';
+        return;
+      }
+      document.getElementById('warning').innerText = '';
+
+      try {
+        await window.api.startRtmpServer(rtmpPort);
+      } catch (err) {
+        document.getElementById('warning').innerText = 'Error: ' + err.message;
+      }
+    }
+    function stopRtmp() { window.api.stopRtmpServer(); }
+    window.api.onServerWarning((msg) => { document.getElementById('warning').innerText = msg; });
+
+    // WASAPI Status
+    window.api.onWasapiStatusChanged(renderWasapiStatus);
+    async function initWasapi() {
+      const status = await window.api.getWasapiStatus();
+      renderWasapiStatus(status);
+    }
+    initWasapi();
+
+    function renderWasapiStatus(status) {
+      const alertDiv = document.getElementById('wasapiAlert');
+      if (status.hasDll && status.hasConfig) {
+        alertDiv.style.display = 'none';
+        return;
+      }
+
+      alertDiv.style.display = 'block';
+      let message = '';
+      if (!status.hasDll) {
+        message = '<strong>WASAPI Relink DLL missing.</strong> Please <a href="https://github.com/Litttlefish/wasapi_relink/releases" target="_blank">download latest DLL</a> and place it in the build folder.<br><br>';
+        message += '<button onclick="window.api.openWasapiFolder()">Open Build Folder</button>';
+      } else if (!status.hasConfig) {
+        message = '<strong>WASAPI Configuration missing.</strong><br> Please copy the default configuration from the project README to the build folder as `redirect_config.toml`.';
+        message += '<button onclick="window.api.openWasapiFolder()">Open Build Folder</button>';
+      }
+      alertDiv.innerHTML = message;
+    }
+  </script>
+</body>
+</html>

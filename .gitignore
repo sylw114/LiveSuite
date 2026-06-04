@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Build Output
+dist/
+tscdist/
+*.log
+*.exe
+*.dll
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Config
+*.toml
