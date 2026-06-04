@@ -8,7 +8,23 @@
     .card { background: #2d2d2d; padding: 15px; margin-bottom: 20px; border-radius: 8px; }
     h2 { margin-top: 0; color: #4fc3f7; }
     input { background: #3c3c3c; border: 1px solid #555; color: white; padding: 5px; border-radius: 4px; }
-    button { padding: 8px 15px; border: none; border-radius: 4px; cursor: pointer; }
+    /* Help buttons */
+    .btn-help {
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      border: 1px solid #777;
+      background: #444;
+      color: #eee;
+      font-size: 12px;
+      padding: 0;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      line-height: 1;
+    }
+    .btn-help:hover { background: #555; }
     button:disabled { background: #555; color: #aaa; cursor: not-allowed; }
     .btn-start { background: #4caf50; color: white; }
     .btn-stop { background: #f44336; color: white; }
@@ -23,9 +39,9 @@
     TCP Port: <input type="number" id="tcpPort" value="9000" min="1" max="65535" style="width: 80px;" oninput="if(this.value.length>5)this.value=this.value.slice(0,5)">
     UDP Port: <input type="number" id="udpPort" value="9000" min="1" max="65535" style="width: 80px;" oninput="if(this.value.length>5)this.value=this.value.slice(0,5)">
     <label><input type="checkbox" id="heartbeat" checked> Heartbeat</label>
-    <button onclick="alert('Enabling this option allows the client to receive heartbeats and calculate transmission latency.')">?</button>
+    <button class="btn-help" onclick="alert('Enabling this option allows the client to receive heartbeats and calculate transmission latency.')">?</button>
     <label><input type="checkbox" id="discardOrder" checked> Discard Out-of-Order</label>
-    <button onclick="alert('This reduces audio latency. When enabled, audio quality is less affected by packet loss but more sensitive to out-of-order packets. Recommended: Enable this, unless the client is using triple-packet transmission.')">?</button>
+    <button class="btn-help" onclick="alert('This reduces audio latency. When enabled, audio quality is less affected by packet loss but more sensitive to out-of-order packets. Recommended: Enable this, unless the client is using triple-packet transmission.')">?</button>
     <br><br>
     <button id="udpStart" class="btn-start" onclick="startUdp()">Start</button>
     <button id="udpStop" class="btn-stop" onclick="stopUdp()" disabled>Stop</button>
