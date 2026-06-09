@@ -15,3 +15,7 @@ Thumbs.db
 
 # Config
 *.toml
+
+# for Agents
+AGENTS.md
+CLAUDE.md

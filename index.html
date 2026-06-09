@@ -1,13 +1,20 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <title>Livesuite Pro</title>
   <style>
     body { font-family: 'Segoe UI', sans-serif; background: #1e1e1e; color: #eee; padding: 20px; }
+    .app-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 20px; }
+    .app-header h1 { margin: 0; }
+    .language-switcher { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
+    select { background: #3c3c3c; border: 1px solid #555; color: white; padding: 5px; border-radius: 4px; }
     .card { background: #2d2d2d; padding: 15px; margin-bottom: 20px; border-radius: 8px; }
     h2 { margin-top: 0; color: #4fc3f7; }
     input { background: #3c3c3c; border: 1px solid #555; color: white; padding: 5px; border-radius: 4px; }
+    .field-row { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+    .field-inline { display: inline-flex; align-items: center; gap: 6px; }
+    .actions { display: flex; align-items: center; gap: 8px; margin-top: 20px; }
     /* Help buttons */
     .btn-help {
       width: 20px;
@@ -29,47 +36,230 @@
     .btn-start { background: #4caf50; color: white; }
     .btn-stop { background: #f44336; color: white; }
     #warning { color: #ff9800; font-weight: bold; margin-top: 10px; }
+    #wasapiAlert { margin-top: 15px; padding: 10px; border: 1px solid #ff9800; border-radius: 4px; display: none; }
+    #wasapiAlert button { margin-top: 10px; }
   </style>
 </head>
 <body>
-  <h1>Livesuite Control</h1>
+  <header class="app-header">
+    <h1 data-i18n="appTitle">Livesuite Control</h1>
+    <label class="language-switcher">
+      <span data-i18n="languageLabel">Language</span>
+      <select id="languageSelect">
+        <option value="zh-CN">中文</option>
+        <option value="en">English</option>
+      </select>
+    </label>
+  </header>
 
   <div class="card">
-    <h2>UDP Audio Server</h2>
-    TCP Port: <input type="number" id="tcpPort" value="9000" min="1" max="65535" style="width: 80px;" oninput="if(this.value.length>5)this.value=this.value.slice(0,5)">
-    UDP Port: <input type="number" id="udpPort" value="9000" min="1" max="65535" style="width: 80px;" oninput="if(this.value.length>5)this.value=this.value.slice(0,5)">
-    <label><input type="checkbox" id="heartbeat" checked> Heartbeat</label>
-    <button class="btn-help" onclick="alert('Enabling this option allows the client to receive heartbeats and calculate transmission latency.')">?</button>
-    <label><input type="checkbox" id="discardOrder" checked> Discard Out-of-Order</label>
-    <button class="btn-help" onclick="alert('This reduces audio latency. When enabled, audio quality is less affected by packet loss but more sensitive to out-of-order packets. Recommended: Enable this, unless the client is using triple-packet transmission.')">?</button>
-    <br><br>
-    <button id="udpStart" class="btn-start" onclick="startUdp()">Start</button>
-    <button id="udpStop" class="btn-stop" onclick="stopUdp()" disabled>Stop</button>
-    <div id="wasapiAlert" style="margin-top: 15px; padding: 10px; border: 1px solid #ff9800; border-radius: 4px; display: none;"></div>
+    <h2 data-i18n="udpAudioServer">UDP Audio Server</h2>
+    <div class="field-row">
+      <label class="field-inline"><span data-i18n="tcpPort">TCP Port</span>: <input type="number" id="tcpPort" value="9000" min="1" max="65535" style="width: 80px;" oninput="if(this.value.length>5)this.value=this.value.slice(0,5)"></label>
+      <label class="field-inline"><span data-i18n="udpPort">UDP Port</span>: <input type="number" id="udpPort" value="9000" min="1" max="65535" style="width: 80px;" oninput="if(this.value.length>5)this.value=this.value.slice(0,5)"></label>
+      <label class="field-inline"><input type="checkbox" id="discardOrder" checked> <span data-i18n="discardOutOfOrder">Discard Out-of-Order</span></label>
+      <button class="btn-help" onclick="showHelp('discardHelp')" data-i18n-title="discardHelpTitle" data-i18n-aria-label="discardHelpTitle">?</button>
+    </div>
+    <div class="field-row" style="margin-top: 10px;">
+      <label class="field-inline"><span data-i18n="dropBaselineMs">Drop Baseline (ms)</span>: <input type="number" id="dropBaselineMs" value="0" min="0" style="width: 80px;"></label>
+      <button class="btn-help" onclick="showHelp('dropBaselineHelp')" data-i18n-title="dropBaselineHelpTitle" data-i18n-aria-label="dropBaselineHelpTitle">?</button>
+      <label class="field-inline"><span data-i18n="protectMs">Protect (ms)</span>: <input type="number" id="protectMs" value="50" min="0" style="width: 80px;"></label>
+      <button class="btn-help" onclick="showHelp('protectHelp')" data-i18n-title="protectHelpTitle" data-i18n-aria-label="protectHelpTitle">?</button>
+    </div>
+    <div class="actions">
+      <button id="udpStart" class="btn-start" onclick="startUdp()" data-i18n="start">Start</button>
+      <button id="udpStop" class="btn-stop" onclick="stopUdp()" disabled data-i18n="stop">Stop</button>
+    </div>
+    <div id="wasapiAlert"></div>
   </div>
 
   <div class="card">
-    <h2>RTMP Server</h2>
-    Port: <input type="number" id="rtmpPort" value="1935" min="1" max="65535" style="width: 80px;" oninput="if(this.value.length>5)this.value=this.value.slice(0,5)">
-    <br><br>
-    <button id="rtmpStart" class="btn-start" onclick="startRtmp()">Start</button>
-    <button id="rtmpStop" class="btn-stop" onclick="stopRtmp()" disabled>Stop</button>
+    <h2 data-i18n="rtmpServer">RTMP Server</h2>
+    <div class="field-row">
+      <label class="field-inline"><span data-i18n="port">Port</span>: <input type="number" id="rtmpPort" value="1935" min="1" max="65535" style="width: 80px;" oninput="if(this.value.length>5)this.value=this.value.slice(0,5)"></label>
+    </div>
+    <div class="actions">
+      <button id="rtmpStart" class="btn-start" onclick="startRtmp()" data-i18n="start">Start</button>
+      <button id="rtmpStop" class="btn-stop" onclick="stopRtmp()" disabled data-i18n="stop">Stop</button>
+    </div>
   </div>
 
   <div id="warning"></div>
 
   <script>
+    const LANGUAGE_STORAGE_KEY = 'livesuite.language';
+    const SUPPORTED_LANGUAGES = ['zh-CN', 'en'];
+    const translations = {
+      'zh-CN': {
+        appTitle: 'Livesuite 控制台',
+        languageLabel: '语言',
+        udpAudioServer: 'UDP 音频服务器',
+        tcpPort: 'TCP 端口',
+        udpPort: 'UDP 端口',
+        discardOutOfOrder: '丢弃乱序包',
+        discardHelpTitle: '丢弃乱序包说明',
+        discardHelp: '此选项可降低音频延迟。启用后，音频质量受丢包影响较小，但对乱序包更敏感。建议启用，除非客户端正在使用三包传输。',
+        dropBaselineMs: '丢弃率基准延迟',
+        dropBaselineHelpTitle: '丢弃率基准延迟说明',
+        dropBaselineHelp: '自适应丢包的基准延迟（毫秒）。值越大丢包越激进。设为 0 可禁用自适应丢弃。',
+        protectMs: '保护延迟',
+        protectHelpTitle: '保护延迟说明',
+        protectHelp: '缓存音频低于此阈值时不会丢包（毫秒）。值越高音频越平滑但延迟越高。',
+        start: '启动',
+        stop: '停止',
+        rtmpServer: 'RTMP 服务器',
+        port: '端口',
+        errorPrefix: '错误：',
+        tcpPortInvalid: 'TCP 端口必须是 1 到 65535 之间的有效数字。',
+        udpPortInvalid: 'UDP 端口必须是 1 到 65535 之间的有效数字。',
+        rtmpPortInvalid: 'RTMP 端口必须是 1 到 65535 之间的有效数字。',
+        wasapiDllMissingTitle: '缺少 WASAPI Relink DLL。',
+        wasapiDllMissingLead: '请',
+        wasapiDownloadLink: '下载最新 DLL',
+        wasapiDllMissingTrail: '并将其放入构建目录。',
+        wasapiConfigMissingTitle: '缺少 WASAPI 配置。',
+        wasapiConfigMissingText: '请从项目 README 复制默认配置到构建目录，并命名为 redirect_config.toml。',
+        openBuildFolder: '打开构建目录'
+      },
+      en: {
+        appTitle: 'Livesuite Control',
+        languageLabel: 'Language',
+        udpAudioServer: 'UDP Audio Server',
+        tcpPort: 'TCP Port',
+        udpPort: 'UDP Port',
+        discardOutOfOrder: 'Discard Out-of-Order',
+        discardHelpTitle: 'Discard out-of-order help',
+        discardHelp: 'This reduces audio latency. When enabled, audio quality is less affected by packet loss but more sensitive to out-of-order packets. Recommended: enable this unless the client is using triple-packet transmission.',
+        dropBaselineMs: 'Drop Baseline (ms)',
+        dropBaselineHelpTitle: 'Drop baseline help',
+        dropBaselineHelp: 'Baseline latency for adaptive packet dropping (ms). Higher values make dropping more aggressive. Set to 0 to disable adaptive dropping.',
+        protectMs: 'Protect (ms)',
+        protectHelpTitle: 'Protect delay help',
+        protectHelp: 'No packets are dropped when cached audio is below this threshold (ms). Higher values give smoother audio but higher latency.',
+        start: 'Start',
+        stop: 'Stop',
+        rtmpServer: 'RTMP Server',
+        port: 'Port',
+        errorPrefix: 'Error: ',
+        tcpPortInvalid: 'TCP Port must be a valid number between 1 and 65535.',
+        udpPortInvalid: 'UDP Port must be a valid number between 1 and 65535.',
+        rtmpPortInvalid: 'RTMP Port must be a valid number between 1 and 65535.',
+        wasapiDllMissingTitle: 'WASAPI Relink DLL missing.',
+        wasapiDllMissingLead: 'Please',
+        wasapiDownloadLink: 'download the latest DLL',
+        wasapiDllMissingTrail: 'and place it in the build folder.',
+        wasapiConfigMissingTitle: 'WASAPI Configuration missing.',
+        wasapiConfigMissingText: 'Please copy the default configuration from the project README to the build folder as redirect_config.toml.',
+        openBuildFolder: 'Open Build Folder'
+      }
+    };
+
+    let currentLanguage = getInitialLanguage();
+    let lastWasapiStatus = null;
+
+    window.api.onServerStatusChanged(updateUI);
+    window.api.onServerWarning((msg) => { showWarning(msg); });
+    window.api.onServerClear(() => { clearWarning(); });
+    window.api.onWasapiStatusChanged(renderWasapiStatus);
+
+    document.getElementById('languageSelect').addEventListener('change', (event) => {
+      setLanguage(event.target.value, true);
+    });
+
+    init();
+
     async function init() {
+      setLanguage(currentLanguage, false);
+      await syncLanguageWithMain();
       const status = await window.api.getServerStatus();
       updateUI(status);
       enforceNumericInputs();
-    }
-    init();
 
-    window.api.onServerStatusChanged(updateUI);
+      const wasapiStatus = await window.api.getWasapiStatus();
+      renderWasapiStatus(wasapiStatus);
+    }
+
+    function getInitialLanguage() {
+      const savedLanguage = localStorage.getItem(LANGUAGE_STORAGE_KEY);
+      if (SUPPORTED_LANGUAGES.includes(savedLanguage)) {
+        return savedLanguage;
+      }
+
+      return navigator.language && navigator.language.toLowerCase().startsWith('zh') ? 'zh-CN' : 'en';
+    }
+
+    function setLanguage(language, shouldPersist) {
+      currentLanguage = normalizeLanguage(language);
+      document.documentElement.lang = currentLanguage;
+      document.getElementById('languageSelect').value = currentLanguage;
+
+      document.querySelectorAll('[data-i18n]').forEach((element) => {
+        element.textContent = t(element.dataset.i18n);
+      });
+      document.querySelectorAll('[data-i18n-title]').forEach((element) => {
+        element.title = t(element.dataset.i18nTitle);
+      });
+      document.querySelectorAll('[data-i18n-aria-label]').forEach((element) => {
+        element.setAttribute('aria-label', t(element.dataset.i18nAriaLabel));
+      });
+
+      if (shouldPersist) {
+        localStorage.setItem(LANGUAGE_STORAGE_KEY, currentLanguage);
+        syncLanguageWithMain();
+      }
+
+      if (lastWasapiStatus) {
+        renderWasapiStatus(lastWasapiStatus);
+      }
+    }
+
+    async function syncLanguageWithMain() {
+      if (window.api.setAppLanguage) {
+        await window.api.setAppLanguage(currentLanguage);
+      }
+    }
+
+    function normalizeLanguage(language) {
+      return language === 'zh-CN' || language === 'zh' ? 'zh-CN' : 'en';
+    }
+
+    function t(key) {
+      return translations[currentLanguage][key] || translations.en[key] || key;
+    }
+
+    function showHelp(key) {
+      const message = t(key);
+      const overlay = document.createElement('div');
+      overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:9999;';
+      const box = document.createElement('div');
+      box.style.cssText = 'background:#2d2d2d;color:#eee;padding:20px 24px;border-radius:8px;max-width:400px;line-height:1.5;';
+      const text = document.createElement('p');
+      text.style.margin = '0 0 16px';
+      text.textContent = message;
+      const btn = document.createElement('button');
+      btn.textContent = 'OK';
+      btn.style.cssText = 'background:#4fc3f7;color:#000;border:none;padding:6px 20px;border-radius:4px;cursor:pointer;';
+      btn.addEventListener('click', () => overlay.remove());
+      box.append(text, btn);
+      overlay.append(box);
+      document.body.append(overlay);
+      overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+    }
+
+    function showWarning(message) {
+      document.getElementById('warning').innerText = message;
+    }
+
+    function clearWarning() {
+      document.getElementById('warning').innerText = '';
+    }
+
+    function showValidationWarning(key) {
+      showWarning(t('errorPrefix') + t(key));
+    }
 
     function enforceNumericInputs() {
-      ['tcpPort', 'udpPort', 'rtmpPort'].forEach(id => {
+      ['tcpPort', 'udpPort', 'rtmpPort', 'dropBaselineMs', 'protectMs'].forEach(id => {
         const el = document.getElementById(id);
         if (el) {
           el.addEventListener('input', (e) => {
@@ -98,71 +288,107 @@
       const udpPort = parseInt(udpPortVal, 10);
 
       if (isNaN(tcpPort) || tcpPort < 1 || tcpPort > 65535) {
-        document.getElementById('warning').innerText = 'Error: TCP Port must be a valid number between 1 and 65535.';
+        showValidationWarning('tcpPortInvalid');
         return;
       }
       if (isNaN(udpPort) || udpPort < 1 || udpPort > 65535) {
-        document.getElementById('warning').innerText = 'Error: UDP Port must be a valid number between 1 and 65535.';
+        showValidationWarning('udpPortInvalid');
         return;
       }
-      document.getElementById('warning').innerText = '';
+      clearWarning();
 
-      try {
-        await window.api.startUdpServer({
+      const rawDropBaseline = Math.max(0, parseInt(document.getElementById('dropBaselineMs').value, 10) || 0);
+      const rawProtect = parseInt(document.getElementById('protectMs').value, 10) || 50;
+      const config = {
           tcpPort: tcpPort,
           udpPort: udpPort,
-          heartbeat: document.getElementById('heartbeat').checked,
-          discardOutOfOrder: document.getElementById('discardOrder').checked
-        });
+          discardOutOfOrder: document.getElementById('discardOrder').checked,
+      };
+      if (rawDropBaseline > 0) {
+          config.dropBaselineMs = rawDropBaseline;
+          config.protectMs = rawProtect;
+      }
+      try {
+        await window.api.startUdpServer(config);
       } catch (err) {
-        document.getElementById('warning').innerText = 'Error: ' + err.message;
+        showWarning(t('errorPrefix') + err.message);
       }
     }
-    function stopUdp() { window.api.stopUdpServer(); }
+
+    function stopUdp() {
+      window.api.stopUdpServer();
+    }
+
     async function startRtmp() {
       const rtmpPortVal = document.getElementById('rtmpPort').value;
       const rtmpPort = parseInt(rtmpPortVal, 10);
 
       if (isNaN(rtmpPort) || rtmpPort < 1 || rtmpPort > 65535) {
-        document.getElementById('warning').innerText = 'Error: RTMP Port must be a valid number between 1 and 65535.';
+        showValidationWarning('rtmpPortInvalid');
         return;
       }
-      document.getElementById('warning').innerText = '';
+      clearWarning();
 
       try {
         await window.api.startRtmpServer(rtmpPort);
       } catch (err) {
-        document.getElementById('warning').innerText = 'Error: ' + err.message;
+        showWarning(t('errorPrefix') + err.message);
       }
     }
-    function stopRtmp() { window.api.stopRtmpServer(); }
-    window.api.onServerWarning((msg) => { document.getElementById('warning').innerText = msg; });
 
-    // WASAPI Status
-    window.api.onWasapiStatusChanged(renderWasapiStatus);
-    async function initWasapi() {
-      const status = await window.api.getWasapiStatus();
-      renderWasapiStatus(status);
+    function stopRtmp() {
+      window.api.stopRtmpServer();
     }
-    initWasapi();
 
     function renderWasapiStatus(status) {
+      lastWasapiStatus = status;
       const alertDiv = document.getElementById('wasapiAlert');
+      alertDiv.replaceChildren();
+
       if (status.hasDll && status.hasConfig) {
         alertDiv.style.display = 'none';
         return;
       }
 
       alertDiv.style.display = 'block';
-      let message = '';
       if (!status.hasDll) {
-        message = '<strong>WASAPI Relink DLL missing.</strong> Please <a href="https://github.com/Litttlefish/wasapi_relink/releases" target="_blank">download latest DLL</a> and place it in the build folder.<br><br>';
-        message += '<button onclick="window.api.openWasapiFolder()">Open Build Folder</button>';
+        const title = document.createElement('strong');
+        title.textContent = t('wasapiDllMissingTitle');
+        const link = document.createElement('a');
+        link.href = 'https://github.com/Litttlefish/wasapi_relink/releases';
+        link.target = '_blank';
+        link.rel = 'noreferrer';
+        link.textContent = t('wasapiDownloadLink');
+
+        alertDiv.append(
+          title,
+          document.createTextNode(' ' + t('wasapiDllMissingLead') + ' '),
+          link,
+          document.createTextNode(' ' + t('wasapiDllMissingTrail')),
+          document.createElement('br'),
+          buildOpenFolderButton()
+        );
       } else if (!status.hasConfig) {
-        message = '<strong>WASAPI Configuration missing.</strong><br> Please copy the default configuration from the project README to the build folder as `redirect_config.toml`.';
-        message += '<button onclick="window.api.openWasapiFolder()">Open Build Folder</button>';
+        const title = document.createElement('strong');
+        title.textContent = t('wasapiConfigMissingTitle');
+        alertDiv.append(
+          title,
+          document.createElement('br'),
+          document.createTextNode(t('wasapiConfigMissingText')),
+          document.createElement('br'),
+          buildOpenFolderButton()
+        );
       }
-      alertDiv.innerHTML = message;
+    }
+
+    function buildOpenFolderButton() {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = t('openBuildFolder');
+      button.addEventListener('click', () => {
+        window.api.openWasapiFolder();
+      });
+      return button;
     }
   </script>
 </body>

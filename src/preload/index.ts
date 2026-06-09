@@ -6,11 +6,15 @@ contextBridge.exposeInMainWorld('api', {
   startRtmpServer: (port: number) => ipcRenderer.invoke('start-rtmp-server', port),
   stopRtmpServer: () => ipcRenderer.invoke('stop-rtmp-server'),
   getServerStatus: () => ipcRenderer.invoke('get-server-status'),
+  setAppLanguage: (language: string) => ipcRenderer.invoke('set-app-language', language),
   onServerStatusChanged: (callback: (status: { udpRunning: boolean; rtmpRunning: boolean }) => void) => {
     ipcRenderer.on('server-status-changed', (_, status) => callback(status));
   },
   onServerWarning: (callback: (message: string) => void) => {
     ipcRenderer.on('server-warning', (_, message) => callback(message));
+  },
+  onServerClear: (callback: (message: string) => void) => {
+    ipcRenderer.on('server-clear', (_, message) => callback(message));
   },
   getWasapiStatus: () => ipcRenderer.invoke('get-wasapi-status'),
   onWasapiStatusChanged: (callback: (status: { hasDll: boolean; hasConfig: boolean }) => void) => {

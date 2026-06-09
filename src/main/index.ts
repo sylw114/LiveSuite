@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, shell, dialog } from 'electron';
+import { app, BrowserWindow, ipcMain, shell, dialog, Menu } from 'electron';
 import { spawn, fork, ChildProcess } from 'child_process';
 import path from 'path';
 import fs from 'fs';
@@ -9,11 +9,51 @@ let rtmpServer: ChildProcess | null = null;
 let udpRunning = false;
 let rtmpRunning = false;
 let isHighLatency = false;
+type AppLanguage = 'zh-CN' | 'en';
+
+let appLanguage: AppLanguage = 'en';
 
 let wasapiStatus = {
   hasDll: false,
   hasConfig: false,
 };
+
+const mainMessages = {
+  'zh-CN': {
+    invalidTcpPort: '无效的 TCP 端口：必须是 1 到 65535 之间的数字',
+    invalidUdpPort: '无效的 UDP 端口：必须是 1 到 65535 之间的数字',
+    invalidRtmpPort: '无效的 RTMP 端口：必须是 1 到 65535 之间的数字',
+    udpHighLatency: 'UDP 服务器：检测到高延迟！',
+    udpLatencyNormal: 'UDP 服务器：延迟已恢复正常。',
+    rtmpErrorTitle: 'RTMP 服务器错误',
+    rtmpStartFailed: 'RTMP 服务器启动失败。请检查端口是否已被占用，或是否存在权限问题。',
+  },
+  en: {
+    invalidTcpPort: 'Invalid TCP Port: Must be a number between 1 and 65535',
+    invalidUdpPort: 'Invalid UDP Port: Must be a number between 1 and 65535',
+    invalidRtmpPort: 'Invalid RTMP Port: Must be a number between 1 and 65535',
+    udpHighLatency: 'UDP Server: High latency detected!',
+    udpLatencyNormal: 'UDP Server: Latency normal.',
+    rtmpErrorTitle: 'RTMP Server Error',
+    rtmpStartFailed: 'Failed to start RTMP Server. Please check if the port is already in use or if there are permission issues.',
+  },
+};
+
+type MainMessageKey = keyof typeof mainMessages.en;
+
+function normalizeAppLanguage(language: unknown): AppLanguage {
+  return typeof language === 'string' && language.toLowerCase().startsWith('zh') ? 'zh-CN' : 'en';
+}
+
+function mainT(key: MainMessageKey) {
+  return mainMessages[appLanguage][key];
+}
+
+function formatRtmpExitMessage(code: number) {
+  return appLanguage === 'zh-CN'
+    ? `RTMP 服务器进程退出，代码：${code}`
+    : `RTMP Server process exited with code ${code}`;
+}
 
 function checkWasapiStatus() {
   const buildDir = path.join(__dirname, '../../../subbuild');
@@ -72,6 +112,10 @@ ipcMain.handle('open-wasapi-folder', () => {
   const buildDir = path.join(__dirname, '../../../subbuild/');
   shell.openPath(buildDir);
 });
+ipcMain.handle('set-app-language', (_, language) => {
+  appLanguage = normalizeAppLanguage(language);
+  return appLanguage;
+});
 
 ipcMain.handle('get-server-status', () => ({ udpRunning, rtmpRunning }));
 
@@ -83,10 +127,10 @@ ipcMain.handle('start-udp-server', (_, config) => {
   const udpPort = parseInt(config.udpPort, 10);
 
   if (isNaN(tcpPort) || tcpPort < 1 || tcpPort > 65535) {
-    throw new Error('Invalid TCP Port: Must be a number between 1 and 65535');
+    throw new Error(mainT('invalidTcpPort'));
   }
   if (isNaN(udpPort) || udpPort < 1 || udpPort > 65535) {
-    throw new Error('Invalid UDP Port: Must be a number between 1 and 65535');
+    throw new Error(mainT('invalidUdpPort'));
   }
 
   const serverPath = path.join(__dirname, '../../../subbuild/audio_server_udp.exe');
@@ -94,8 +138,16 @@ ipcMain.handle('start-udp-server', (_, config) => {
     '--tcp', tcpPort.toString(),
     '--udp', udpPort.toString()
   ];
-  if (config.heartbeat) args.push('--heartbeat');
   if (config.discardOutOfOrder) args.push('--discard-out-of-order');
+  const dropBaselineMs = typeof config.dropBaselineMs === 'number' && !isNaN(config.dropBaselineMs)
+    ? Math.max(0, config.dropBaselineMs) : 0;
+  const protectMs = typeof config.protectMs === 'number' && !isNaN(config.protectMs)
+    ? config.protectMs : null;
+
+  if (dropBaselineMs > 0) {
+    args.push('--drop-baseline-duration-ms', dropBaselineMs.toString());
+    if (protectMs != null) args.push('--protect-ms', protectMs.toString());
+  }
 
   udpServer = spawn(serverPath, args, {cwd: path.dirname(serverPath)});
 
@@ -117,10 +169,10 @@ ipcMain.handle('start-udp-server', (_, config) => {
 
       if (isCurrentlyHigh && !isHighLatency) {
         isHighLatency = true;
-        mainWindow?.webContents.send('server-warning', 'UDP Server: High latency detected!');
+        mainWindow?.webContents.send('server-warning', mainT('udpHighLatency'));
       } else if (!isCurrentlyHigh && isHighLatency) {
         isHighLatency = false;
-        mainWindow?.webContents.send('server-clear', 'UDP Server: Latency normal.');
+        mainWindow?.webContents.send('server-clear', mainT('udpLatencyNormal'));
       }
     }
   });
@@ -147,7 +199,7 @@ ipcMain.handle('start-rtmp-server', (_, port) => {
 
   const rtmpPort = parseInt(port, 10);
   if (isNaN(rtmpPort) || rtmpPort < 1 || rtmpPort > 65535) {
-    throw new Error('Invalid RTMP Port: Must be a number between 1 and 65535');
+    throw new Error(mainT('invalidRtmpPort'));
   }
 
   rtmpServer = fork(path.join(__dirname, 'nms_worker.js'));
@@ -167,11 +219,11 @@ ipcMain.handle('start-rtmp-server', (_, port) => {
     rtmpServer = null
     updateStatus()
     if(code === 1){
-      dialog.showErrorBox('RTMP Server Error', 'Failed to start RTMP Server. Please check if the port is already in use or if there are permission issues.')
+      dialog.showErrorBox(mainT('rtmpErrorTitle'), mainT('rtmpStartFailed'))
       return
     }
     if (code !== 0 && code !== null) {
-      throw new Error(`RTMP Server process exited with code ${code}`)
+      throw new Error(formatRtmpExitMessage(code))
     }
   });
 });
@@ -184,4 +236,5 @@ ipcMain.handle('stop-rtmp-server', () => {
   updateStatus();
 });
 
+Menu.setApplicationMenu(null);
 app.whenReady().then(createWindow);
