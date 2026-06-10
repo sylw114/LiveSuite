@@ -1,10 +1,14 @@
+# 直播套件，搭配[VideoStreamer](https://github.com/sylw114/AndroidVideoStreamer/)使用
+
+它提供了rtmp流服务器和一个低延迟音频服务器（后者仅本程序提供）。在测试平台上可以达到约90ms的音频延迟。不过需要开启一些以音质和音频稳定性为代价的选项。如果不开启，延迟会逐渐从90ms开始增长，这是因为延迟取决于最慢的一个包，而最慢的包可能变得更慢。
+
+它可以搭配[wasapi_relink](https://github.com/Litttlefish/wasapi_relink)使用以进一步降低音频延迟，但实际效果取决于你的设备，并效果不大（十几毫秒）
+
+它使用了重排序以提高音频稳定性，在拥有足够冗余缓冲数据时，会将乱序音频重组成正常顺序的音频。但是你也可以禁用这一条（开启丢弃乱序包选项），以获取轻微的延迟提升。
 
 
 
-
-
-
-### 推荐配置（请保存为redirect_config.toml在subbuild文件夹中）
+### [wasapi_relink](https://github.com/Litttlefish/wasapi_relink)推荐配置（请保存为redirect_config.toml在subbuild文件夹中）
 
 ```toml
 # 日志文件路径。"" (空字符串) 默认为当前工作目录。
