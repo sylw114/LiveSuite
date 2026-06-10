@@ -8,7 +8,6 @@
     "dist": "electron-builder"
   },
   "build": {
-    "appId": "com.livesuite.app",
     "files": [
       "tscdist/**/*",
       "index.html",
