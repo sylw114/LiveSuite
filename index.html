@@ -38,18 +38,94 @@
     #warning { color: #ff9800; font-weight: bold; margin-top: 10px; }
     #wasapiAlert { margin-top: 15px; padding: 10px; border: 1px solid #ff9800; border-radius: 4px; display: none; }
     #wasapiAlert button { margin-top: 10px; }
+    /* RTMP connections panel */
+    .rtmp-connections { margin-top: 15px; border-top: 1px solid #444; padding-top: 10px; }
+    .rtmp-connections h3 { margin: 0 0 10px; font-size: 14px; color: #aaa; }
+    .stream-item { background: #363636; border-radius: 6px; padding: 10px 12px; margin-bottom: 8px; }
+    .stream-header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .stream-path { font-family: 'Consolas', monospace; font-size: 13px; color: #4fc3f7; word-break: break-all; }
+    .stream-viewers-count { font-size: 11px; color: #aaa; }
+    .btn-sm { padding: 3px 10px; font-size: 12px; border-radius: 4px; border: none; cursor: pointer; }
+    .btn-copy { background: #2196f3; color: white; }
+    .btn-copy:hover { background: #1976d2; }
+    .btn-copy.copied { background: #4caf50; }
+    .btn-expand { background: #555; color: white; }
+    .btn-expand:hover { background: #666; }
+    .btn-show-ips { background: #9c27b0; color: white; margin-top: 10px; }
+    .btn-show-ips:hover { background: #7b1fa2; }
+    .viewer-list { margin-top: 8px; padding: 8px 12px; background: #2a2a2a; border-radius: 4px; font-family: 'Consolas', monospace; font-size: 12px; color: #bbb; }
+    .viewer-list div { padding: 2px 0; }
+    .no-streams { color: #777; font-style: italic; font-size: 13px; }
+    /* Modal overlay */
+    .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 9999; }
+    .modal-box { background: #2d2d2d; color: #eee; padding: 20px 24px; border-radius: 8px; max-width: 420px; }
+    .modal-box h3 { margin: 0 0 12px; color: #4fc3f7; }
+    .modal-box ul { margin: 0 0 16px; padding-left: 20px; }
+    .modal-box li { font-family: 'Consolas', monospace; font-size: 13px; padding: 2px 0; }
+    .modal-box .btn-close { background: #4fc3f7; color: #000; border: none; padding: 6px 20px; border-radius: 4px; cursor: pointer; }
+    .modal-box .btn-close:hover { background: #29b6f6; }
+    /* About button */
+    .btn-about {
+      background: transparent;
+      border: 1px solid #777;
+      color: #eee;
+      padding: 4px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    .btn-about:hover { background: #3c3c3c; }
+    /* License dialog */
+    .license-dialog { max-width: 700px; max-height: 80vh; }
+    .license-content {
+      background: #1e1e1e;
+      border: 1px solid #444;
+      border-radius: 4px;
+      padding: 12px;
+      margin: 12px 0;
+      max-height: 50vh;
+      overflow-y: auto;
+      font-family: 'Consolas', monospace;
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .license-tabs {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .license-tab {
+      background: #3c3c3c;
+      border: 1px solid #555;
+      color: #eee;
+      padding: 4px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    .license-tab.active {
+      background: #4fc3f7;
+      color: #000;
+      border-color: #4fc3f7;
+    }
+    .license-tab:hover:not(.active) { background: #4c4c4c; }
   </style>
 </head>
 <body>
   <header class="app-header">
     <h1 data-i18n="appTitle">Livesuite Control</h1>
-    <label class="language-switcher">
-      <span data-i18n="languageLabel">Language</span>
-      <select id="languageSelect">
-        <option value="zh-CN">中文</option>
-        <option value="en">English</option>
-      </select>
-    </label>
+    <div style="display: flex; align-items: center; gap: 12px;">
+      <button class="btn-about" onclick="showAboutDialog()" data-i18n="about">About</button>
+      <label class="language-switcher">
+        <span data-i18n="languageLabel">Language</span>
+        <select id="languageSelect">
+          <option value="zh-CN">中文</option>
+          <option value="en">English</option>
+        </select>
+      </label>
+    </div>
   </header>
 
   <div class="card">
@@ -81,6 +157,11 @@
     <div class="actions">
       <button id="rtmpStart" class="btn-start" onclick="startRtmp()" data-i18n="start">Start</button>
       <button id="rtmpStop" class="btn-stop" onclick="stopRtmp()" disabled data-i18n="stop">Stop</button>
+    </div>
+    <div class="rtmp-connections" id="rtmpConnections" style="display: none;">
+      <h3 data-i18n="activeConnections">Active Connections</h3>
+      <div id="streamList"></div>
+      <button class="btn-sm btn-show-ips" onclick="showLocalIps()" data-i18n="showLocalIps">Show Local IPs</button>
     </div>
   </div>
 
@@ -119,7 +200,23 @@
         wasapiDllMissingTrail: '并将其放入构建目录。',
         wasapiConfigMissingTitle: '缺少 WASAPI 配置。',
         wasapiConfigMissingText: '请从项目 README 复制默认配置到构建目录，并命名为 redirect_config.toml。',
-        openBuildFolder: '打开构建目录'
+        openBuildFolder: '打开构建目录',
+        activeConnections: '活跃连接',
+        showLocalIps: '显示本地 IP',
+        copyPullUrl: '复制拉流地址',
+        viewers: '查看拉流',
+        noViewers: '无拉流连接',
+        localIpsTitle: '本机 IP 地址',
+        pullUrlPrefix: '拉流地址 (RTMP):',
+        viewerAddresses: '拉流地址:',
+        about: '关于',
+        aboutTitle: '关于 Livesuite',
+        viewLicenses: '查看开源许可证',
+        summary: '摘要',
+        fullLicenses: '完整许可证',
+        loading: '加载中...',
+        errorPrefix: '错误：',
+        close: '关闭'
       },
       en: {
         appTitle: 'Livesuite Control',
@@ -150,7 +247,22 @@
         wasapiDllMissingTrail: 'and place it in the build folder.',
         wasapiConfigMissingTitle: 'WASAPI Configuration missing.',
         wasapiConfigMissingText: 'Please copy the default configuration from the project README to the build folder as redirect_config.toml.',
-        openBuildFolder: 'Open Build Folder'
+        openBuildFolder: 'Open Build Folder',
+        activeConnections: 'Active Connections',
+        showLocalIps: 'Show Local IPs',
+        copyPullUrl: 'Copy Pull URL',
+        viewers: 'Viewers',
+        noViewers: 'No viewers',
+        localIpsTitle: 'Local IP Addresses',
+        pullUrlPrefix: 'Pull URL (RTMP):',
+        viewerAddresses: 'Viewer addresses:',
+        about: 'About',
+        aboutTitle: 'About Livesuite',
+        viewLicenses: 'View Open Source Licenses',
+        summary: 'Summary',
+        fullLicenses: 'Full Licenses',
+        loading: 'Loading...',
+        close: 'Close'
       }
     };
 
@@ -161,6 +273,7 @@
     window.api.onServerWarning((msg) => { showWarning(msg); });
     window.api.onServerClear(() => { clearWarning(); });
     window.api.onWasapiStatusChanged(renderWasapiStatus);
+    window.api.onRtmpConnectionsUpdated(renderRtmpConnections);
 
     document.getElementById('languageSelect').addEventListener('change', (event) => {
       setLanguage(event.target.value, true);
@@ -340,6 +453,136 @@
       window.api.stopRtmpServer();
     }
 
+    // Track which streams have their viewer list expanded
+    const expandedStreams = new Set();
+
+    function renderRtmpConnections(streams) {
+      const panel = document.getElementById('rtmpConnections');
+      const rtmpRunning = document.getElementById('rtmpStop').disabled === false;
+      panel.style.display = rtmpRunning ? 'block' : 'none';
+      renderStreamList(streams || []);
+    }
+
+    function renderStreamList(streams) {
+      const container = document.getElementById('streamList');
+      container.replaceChildren();
+
+      if (streams.length === 0) {
+        const noStreams = document.createElement('div');
+        noStreams.className = 'no-streams';
+        noStreams.textContent = t('noViewers');
+        container.appendChild(noStreams);
+        return;
+      }
+
+      for (const stream of streams) {
+        const item = document.createElement('div');
+        item.className = 'stream-item';
+
+        const header = document.createElement('div');
+        header.className = 'stream-header';
+
+        // Stream path
+        const pathEl = document.createElement('span');
+        pathEl.className = 'stream-path';
+        pathEl.textContent = stream.streamPath;
+
+        // Viewer count
+        const countEl = document.createElement('span');
+        countEl.className = 'stream-viewers-count';
+        countEl.textContent = '(' + t('viewers') + ': ' + stream.viewers.length + ')';
+
+        // Copy pull URL button
+        const copyBtn = document.createElement('button');
+        copyBtn.className = 'btn-sm btn-copy';
+        copyBtn.textContent = t('copyPullUrl');
+        copyBtn.addEventListener('click', () => copyPullUrl(stream.streamPath, copyBtn));
+
+        // Expand/collapse viewers button (only show if there are viewers)
+        const expandBtn = document.createElement('button');
+        expandBtn.className = 'btn-sm btn-expand';
+        const isExpanded = expandedStreams.has(stream.streamPath);
+        expandBtn.textContent = isExpanded ? '\u25B2' : '\u25B6'; // ▲ or ▶
+        expandBtn.style.display = stream.viewers.length > 0 ? '' : 'none';
+        expandBtn.addEventListener('click', () => {
+          if (expandedStreams.has(stream.streamPath)) {
+            expandedStreams.delete(stream.streamPath);
+          } else {
+            expandedStreams.add(stream.streamPath);
+          }
+          renderStreamList(streams);
+        });
+
+        header.append(pathEl, countEl, copyBtn, expandBtn);
+        item.appendChild(header);
+
+        // Expanded viewer list
+        if (isExpanded && stream.viewers.length > 0) {
+          const viewerList = document.createElement('div');
+          viewerList.className = 'viewer-list';
+
+          const label = document.createElement('div');
+          label.style.color = '#4fc3f7';
+          label.textContent = t('viewerAddresses');
+          viewerList.appendChild(label);
+
+          for (const viewerId of stream.viewers) {
+            const viewerEl = document.createElement('div');
+            viewerEl.textContent = '  ID: ' + viewerId;
+            viewerList.appendChild(viewerEl);
+          }
+
+          item.appendChild(viewerList);
+        }
+
+        container.appendChild(item);
+      }
+    }
+
+    function copyPullUrl(streamPath, btn) {
+      const rtmpPort = document.getElementById('rtmpPort').value || '1935';
+      const pullUrl = 'rtmp://localhost:' + rtmpPort + streamPath;
+      navigator.clipboard.writeText(pullUrl).then(() => {
+        btn.textContent = '\u2713';
+        btn.classList.add('copied');
+        setTimeout(() => {
+          btn.textContent = t('copyPullUrl');
+          btn.classList.remove('copied');
+        }, 1500);
+      });
+    }
+
+    async function showLocalIps() {
+      const ips = await window.api.getLocalIps();
+      const rtmpPort = document.getElementById('rtmpPort').value || '1935';
+
+      const overlay = document.createElement('div');
+      overlay.className = 'modal-overlay';
+
+      const box = document.createElement('div');
+      box.className = 'modal-box';
+
+      const title = document.createElement('h3');
+      title.textContent = t('localIpsTitle');
+
+      const list = document.createElement('ul');
+      for (const ip of ips) {
+        const li = document.createElement('li');
+        li.textContent = 'rtmp://' + ip + ':' + rtmpPort;
+        list.appendChild(li);
+      }
+
+      const closeBtn = document.createElement('button');
+      closeBtn.className = 'btn-close';
+      closeBtn.textContent = 'OK';
+      closeBtn.addEventListener('click', () => overlay.remove());
+
+      box.append(title, list, closeBtn);
+      overlay.append(box);
+      document.body.append(overlay);
+      overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+    }
+
     function renderWasapiStatus(status) {
       lastWasapiStatus = status;
       const alertDiv = document.getElementById('wasapiAlert');
@@ -389,6 +632,100 @@
         window.api.openWasapiFolder();
       });
       return button;
+    }
+
+    async function showAboutDialog() {
+      const overlay = document.createElement('div');
+      overlay.className = 'modal-overlay';
+
+      const box = document.createElement('div');
+      box.className = 'modal-box license-dialog';
+
+      const title = document.createElement('h3');
+      title.textContent = t('aboutTitle');
+
+      const appInfo = document.createElement('p');
+      appInfo.style.margin = '8px 0 16px';
+      appInfo.style.color = '#aaa';
+      appInfo.textContent = 'Livesuite v1.0.0';
+
+      const viewLicensesBtn = document.createElement('button');
+      viewLicensesBtn.className = 'btn-close';
+      viewLicensesBtn.textContent = t('viewLicenses');
+      viewLicensesBtn.style.marginBottom = '16px';
+      viewLicensesBtn.addEventListener('click', async () => {
+        viewLicensesBtn.disabled = true;
+        viewLicensesBtn.textContent = t('loading');
+        await showLicenseDialog(box);
+        viewLicensesBtn.disabled = false;
+        viewLicensesBtn.textContent = t('viewLicenses');
+      });
+
+      const closeBtn = document.createElement('button');
+      closeBtn.className = 'btn-close';
+      closeBtn.textContent = t('close');
+      closeBtn.addEventListener('click', () => overlay.remove());
+
+      box.append(title, appInfo, viewLicensesBtn, closeBtn);
+      overlay.append(box);
+      document.body.append(overlay);
+      overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+    }
+
+    async function showLicenseDialog(container) {
+      // Remove existing license content if any
+      const existingContent = container.querySelector('.license-dialog-content');
+      if (existingContent) {
+        existingContent.remove();
+      }
+
+      const dialogContent = document.createElement('div');
+      dialogContent.className = 'license-dialog-content';
+
+      const tabs = document.createElement('div');
+      tabs.className = 'license-tabs';
+
+      const summaryTab = document.createElement('button');
+      summaryTab.className = 'license-tab active';
+      summaryTab.textContent = t('summary');
+      summaryTab.addEventListener('click', () => loadLicenseContent('summary', summaryTab, contentArea));
+
+      const fullTab = document.createElement('button');
+      fullTab.className = 'license-tab';
+      fullTab.textContent = t('fullLicenses');
+      fullTab.addEventListener('click', () => loadLicenseContent('full', fullTab, contentArea));
+
+      tabs.append(summaryTab, fullTab);
+
+      const contentArea = document.createElement('div');
+      contentArea.className = 'license-content';
+      contentArea.textContent = t('loading');
+
+      dialogContent.append(tabs, contentArea);
+      container.insertBefore(dialogContent, container.querySelector('button'));
+
+      // Load summary by default
+      await loadLicenseContent('summary', summaryTab, contentArea);
+    }
+
+    async function loadLicenseContent(type, activeTab, contentArea) {
+      // Update active tab
+      activeTab.parentElement.querySelectorAll('.license-tab').forEach(tab => {
+        tab.classList.remove('active');
+      });
+      activeTab.classList.add('active');
+
+      try {
+        if (type === 'summary') {
+          const content = await window.api.getLicenseContent('summary');
+          contentArea.textContent = content;
+        } else {
+          const content = await window.api.getLicenseContent('full');
+          contentArea.textContent = content;
+        }
+      } catch (err) {
+        contentArea.textContent = t('errorPrefix') + err.message;
+      }
     }
   </script>
 </body>

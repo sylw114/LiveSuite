@@ -1,11 +1,12 @@
 import { app, BrowserWindow, ipcMain, shell, dialog, Menu } from 'electron';
-import { spawn, fork, ChildProcess } from 'child_process';
+import { spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import fs from 'fs';
+import NodeMediaServer from 'node-media-server';
 
 let mainWindow: BrowserWindow | null;
 let udpServer: ChildProcess | null = null;
-let rtmpServer: ChildProcess | null = null;
+let rtmpServer: NodeMediaServer | null = null;
 let udpRunning = false;
 let rtmpRunning = false;
 let isHighLatency = false;
@@ -47,12 +48,6 @@ function normalizeAppLanguage(language: unknown): AppLanguage {
 
 function mainT(key: MainMessageKey) {
   return mainMessages[appLanguage][key];
-}
-
-function formatRtmpExitMessage(code: number) {
-  return appLanguage === 'zh-CN'
-    ? `RTMP 服务器进程退出，代码：${code}`
-    : `RTMP Server process exited with code ${code}`;
 }
 
 function checkWasapiStatus() {
@@ -194,6 +189,76 @@ ipcMain.handle('stop-udp-server', () => {
 });
 
 // RTMP Server Control
+interface PublisherInfo {
+  streamPath: string;
+}
+
+interface ViewerInfo {
+  streamPath: string;
+  ip: string;
+}
+
+let activePublishers: Map<string, PublisherInfo> = new Map();
+let activeViewers: Map<string, ViewerInfo> = new Map();
+
+function broadcastRtmpConnections() {
+  const streams: Array<{ streamPath: string; publisherId: string; viewers: string[] }> = [];
+  for (const [id, pub] of activePublishers) {
+    const viewers: string[] = [];
+    for (const [, viewer] of activeViewers) {
+      if (viewer.streamPath === pub.streamPath) {
+        viewers.push(viewer.ip);
+      }
+    }
+    streams.push({ streamPath: pub.streamPath, publisherId: id, viewers });
+  }
+  mainWindow?.webContents.send('rtmp-connections-updated', streams);
+}
+
+function getViewerIp(session: any): string {
+  try {
+    const socket = session.socket;
+    if (socket && socket.remoteAddress) {
+      return socket.remoteAddress;
+    }
+  } catch {
+    // ignore
+  }
+  return 'unknown';
+}
+
+function getLocalIps(): string[] {
+  const os = require('os');
+  const interfaces = os.networkInterfaces();
+  const ips: string[] = ['localhost'];
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of (interfaces[name] || [])) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        ips.push(iface.address);
+      }
+    }
+  }
+  return ips;
+}
+
+ipcMain.handle('get-local-ips', () => getLocalIps());
+
+ipcMain.handle('get-license-content', (_, type: 'summary' | 'full') => {
+  try {
+    const licensesDir = path.join(__dirname, '../../../licenses');
+    if (type === 'summary') {
+      const summaryPath = path.join(licensesDir, 'LICENSE_SUMMARY.md');
+      return fs.readFileSync(summaryPath, 'utf-8');
+    } else {
+      const textPath = path.join(licensesDir, 'THIRD_PARTY_LICENSES.txt');
+      return fs.readFileSync(textPath, 'utf-8');
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return `Failed to load license content: ${message}`;
+  }
+});
+
 ipcMain.handle('start-rtmp-server', (_, port) => {
   if (rtmpRunning) return;
 
@@ -202,38 +267,73 @@ ipcMain.handle('start-rtmp-server', (_, port) => {
     throw new Error(mainT('invalidRtmpPort'));
   }
 
-  rtmpServer = fork(path.join(__dirname, 'nms_worker.js'));
+  activePublishers = new Map();
+  activeViewers = new Map();
 
-  rtmpServer.on('error', (err) => {
-    rtmpRunning = false;
-    updateStatus();
-    throw err;
+  rtmpServer = new NodeMediaServer({
+    rtmp: {
+      port: rtmpPort,
+      chunk_size: 30000,
+      gop_cache: false,
+      ping: 30,
+      ping_timeout: 60
+    }
   });
 
-  rtmpServer.send({ type: 'start', port: rtmpPort });
+  rtmpServer.on('serverError', (err) => {
+    console.error(err);
+    rtmpRunning = false;
+    rtmpServer = null;
+    updateStatus();
+    dialog.showErrorBox(mainT('rtmpErrorTitle'), mainT('rtmpStartFailed'));
+  });
+
+  rtmpServer.on('postPublish', (session) => {
+    const streamPath = session.streamPath;
+    const id = session.id;
+    console.log(`[NodeMediaServer] Stream published: ${streamPath}`);
+    activePublishers.set(id, { streamPath });
+    broadcastRtmpConnections();
+  });
+
+  rtmpServer.on('donePublish', (session) => {
+    const id = session.id;
+    console.log(`[NodeMediaServer] Stream donePublish: ${session.streamPath}`);
+    activePublishers.delete(id);
+    broadcastRtmpConnections();
+  });
+
+  rtmpServer.on('postPlay', (session) => {
+    const streamPath = session.streamPath;
+    const viewerId = session.id;
+    const ip = getViewerIp(session);
+    console.log(`[NodeMediaServer] Viewer connected: ${streamPath} (${ip})`);
+    activeViewers.set(viewerId, { streamPath, ip });
+    broadcastRtmpConnections();
+  });
+
+  rtmpServer.on('donePlay', (session) => {
+    const viewerId = session.id;
+    console.log(`[NodeMediaServer] Viewer disconnected: ${session.streamPath}`);
+    activeViewers.delete(viewerId);
+    broadcastRtmpConnections();
+  });
+
+  rtmpServer.run();
   rtmpRunning = true;
   updateStatus();
-
-  rtmpServer.on('exit', (code) => {
-    rtmpRunning = false
-    rtmpServer = null
-    updateStatus()
-    if(code === 1){
-      dialog.showErrorBox(mainT('rtmpErrorTitle'), mainT('rtmpStartFailed'))
-      return
-    }
-    if (code !== 0 && code !== null) {
-      throw new Error(formatRtmpExitMessage(code))
-    }
-  });
 });
 
 ipcMain.handle('stop-rtmp-server', () => {
   if (!rtmpRunning) return;
-  rtmpServer?.kill();
-  rtmpServer = null;
-  rtmpRunning = false;
-  updateStatus();
+  activePublishers = new Map();
+  activeViewers = new Map();
+  broadcastRtmpConnections();
+  rtmpServer?.stop(() => {
+    rtmpRunning = false;
+    rtmpServer = null;
+    updateStatus();
+  });
 });
 
 Menu.setApplicationMenu(null);

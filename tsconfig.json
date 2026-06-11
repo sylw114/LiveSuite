@@ -5,7 +5,8 @@
     "outDir": "./tscdist",
     "strict": true,
     "esModuleInterop": true,
-    "rootDir": "./src"
+    "rootDir": "./src",
+    "skipLibCheck": true
   },
   "include": ["src", "src/types"]
 }

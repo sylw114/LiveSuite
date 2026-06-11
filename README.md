@@ -45,3 +45,52 @@ mode = "Compat"
 compat_buffer_dur_hns.48000 = 0 # 这个会被限制到最低允许值
 compat_buffer_dur_hns.96000 = 238350
 ```
+
+## 开源许可证与合规
+
+本项目使用 [license-checker](https://github.com/davglass/license-checker) 自动生成第三方依赖的许可证文档。
+
+### 生成许可证文档
+
+```bash
+# 生成所有格式的许可证文档（推荐）
+npm run licenses
+
+# 仅生成 JSON 格式
+npm run licenses:check
+
+# 仅生成 CSV 格式
+npm run licenses:csv
+
+# 仅生成文本格式
+npm run licenses:text
+```
+
+### 打包发布
+
+```bash
+# 完整构建和发布流程（会自动生成许可证文档）
+npm run release
+
+# 或手动分步执行
+npm run build        # 编译 TypeScript
+npm run licenses     # 生成许可证文档
+npm run dist         # 打包安装程序
+```
+
+### 许可证文档说明
+
+构建后，`licenses/` 目录将包含以下文件：
+
+| 文件 | 格式 | 用途 |
+|------|------|------|
+| `licenses.json` | JSON | 程序化处理和集成 |
+| `licenses.csv` | CSV | 电子表格和数据库导入 |
+| `THIRD_PARTY_LICENSES.txt` | 文本 | 完整许可证声明，法律合规 |
+| `LICENSE_SUMMARY.md` | Markdown | 许可证类型摘要，快速查看 |
+
+这些文件会自动打包到安装程序的 `resources/licenses/` 目录中。
+
+### 应用内查看
+
+用户可以在应用内点击标题栏的"关于"按钮，查看第三方开源许可证信息。

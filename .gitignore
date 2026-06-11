@@ -16,6 +16,9 @@ Thumbs.db
 # Config
 *.toml
 
+# Generated Licenses
+licenses/
+
 # for Agents
 AGENTS.md
 CLAUDE.md
