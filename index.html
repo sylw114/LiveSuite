@@ -161,7 +161,7 @@
     <div class="rtmp-connections" id="rtmpConnections" style="display: none;">
       <h3 data-i18n="activeConnections">Active Connections</h3>
       <div id="streamList"></div>
-      <button class="btn-sm btn-show-ips" onclick="showLocalIps()" data-i18n="showLocalIps">Show Local IPs</button>
+      <button class="btn-sm btn-show-ips" onclick="showLocalAddresses()" data-i18n="showLocalAddresses">Show Local IPs</button>
     </div>
   </div>
 
@@ -202,11 +202,11 @@
         wasapiConfigMissingText: '请从项目 README 复制默认配置到构建目录，并命名为 redirect_config.toml。',
         openBuildFolder: '打开构建目录',
         activeConnections: '活跃连接',
-        showLocalIps: '显示本地 IP',
+        showLocalAddresses: '显示所有连接地址',
         copyPullUrl: '复制拉流地址',
         viewers: '查看拉流',
         noViewers: '无拉流连接',
-        localIpsTitle: '本机 IP 地址',
+        localAddressesTitle: '连接地址',
         pullUrlPrefix: '拉流地址 (RTMP):',
         viewerAddresses: '拉流地址:',
         about: '关于',
@@ -249,11 +249,11 @@
         wasapiConfigMissingText: 'Please copy the default configuration from the project README to the build folder as redirect_config.toml.',
         openBuildFolder: 'Open Build Folder',
         activeConnections: 'Active Connections',
-        showLocalIps: 'Show Local IPs',
+        showLocalAddresses: 'Show All Connection Addresses',
         copyPullUrl: 'Copy Pull URL',
         viewers: 'Viewers',
         noViewers: 'No viewers',
-        localIpsTitle: 'Local IP Addresses',
+        localAddressesTitle: 'Connection Addresses',
         pullUrlPrefix: 'Pull URL (RTMP):',
         viewerAddresses: 'Viewer addresses:',
         about: 'About',
@@ -552,8 +552,8 @@
       });
     }
 
-    async function showLocalIps() {
-      const ips = await window.api.getLocalIps();
+    async function showLocalAddresses() {
+      const ips = await window.api.getlocalAddresses();
       const rtmpPort = document.getElementById('rtmpPort').value || '1935';
 
       const overlay = document.createElement('div');
@@ -563,7 +563,7 @@
       box.className = 'modal-box';
 
       const title = document.createElement('h3');
-      title.textContent = t('localIpsTitle');
+      title.textContent = t('localAddressesTitle');
 
       const list = document.createElement('ul');
       for (const ip of ips) {

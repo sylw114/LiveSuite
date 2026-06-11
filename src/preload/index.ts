@@ -7,7 +7,7 @@ contextBridge.exposeInMainWorld('api', {
   stopRtmpServer: () => ipcRenderer.invoke('stop-rtmp-server'),
   getServerStatus: () => ipcRenderer.invoke('get-server-status'),
   setAppLanguage: (language: string) => ipcRenderer.invoke('set-app-language', language),
-  getLocalIps: () => ipcRenderer.invoke('get-local-ips'),
+  getlocalAddresses: () => ipcRenderer.invoke('get-local-ips'),
   getLicenseContent: (type: 'summary' | 'full') => ipcRenderer.invoke('get-license-content', type),
   onServerStatusChanged: (callback: (status: { udpRunning: boolean; rtmpRunning: boolean }) => void) => {
     ipcRenderer.on('server-status-changed', (_, status) => callback(status));

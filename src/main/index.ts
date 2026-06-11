@@ -227,7 +227,7 @@ function getViewerIp(session: any): string {
   return 'unknown';
 }
 
-function getLocalIps(): string[] {
+function getlocalAddresses(): string[] {
   const os = require('os');
   const interfaces = os.networkInterfaces();
   const ips: string[] = ['localhost'];
@@ -241,7 +241,7 @@ function getLocalIps(): string[] {
   return ips;
 }
 
-ipcMain.handle('get-local-ips', () => getLocalIps());
+ipcMain.handle('get-local-ips', () => getlocalAddresses());
 
 ipcMain.handle('get-license-content', (_, type: 'summary' | 'full') => {
   try {
