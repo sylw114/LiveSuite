@@ -432,6 +432,8 @@
       window.api.stopUdpServer();
     }
 
+    const rtmpConnectionsE = document.getElementById('rtmpConnections');
+
     async function startRtmp() {
       const rtmpPortVal = document.getElementById('rtmpPort').value;
       const rtmpPort = parseInt(rtmpPortVal, 10);
@@ -444,22 +446,20 @@
 
       try {
         await window.api.startRtmpServer(rtmpPort);
+        rtmpConnectionsE.style.display = 'block';
       } catch (err) {
         showWarning(t('errorPrefix') + err.message);
       }
     }
 
     function stopRtmp() {
-      window.api.stopRtmpServer();
+      window.api.stopRtmpServer().then(() => {rtmpConnectionsE.style.display = 'none'});
     }
 
     // Track which streams have their viewer list expanded
     const expandedStreams = new Set();
 
     function renderRtmpConnections(streams) {
-      const panel = document.getElementById('rtmpConnections');
-      const rtmpRunning = document.getElementById('rtmpStop').disabled === false;
-      panel.style.display = rtmpRunning ? 'block' : 'none';
       renderStreamList(streams || []);
     }
 
