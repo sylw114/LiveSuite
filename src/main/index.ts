@@ -324,16 +324,15 @@ ipcMain.handle('start-rtmp-server', (_, port) => {
   updateStatus();
 });
 
-ipcMain.handle('stop-rtmp-server', () => {
+ipcMain.handle('stop-rtmp-server', async() => {
   if (!rtmpRunning) return;
+  broadcastRtmpConnections();
+  await rtmpServer?.stop();
+  rtmpRunning = false;
+  rtmpServer = null;
+  updateStatus();
   activePublishers = new Map();
   activeViewers = new Map();
-  broadcastRtmpConnections();
-  rtmpServer?.stop(() => {
-    rtmpRunning = false;
-    rtmpServer = null;
-    updateStatus();
-  });
 });
 
 Menu.setApplicationMenu(null);

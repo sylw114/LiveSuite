@@ -4,7 +4,7 @@ contextBridge.exposeInMainWorld('api', {
   startUdpServer: (config: any) => ipcRenderer.invoke('start-udp-server', config),
   stopUdpServer: () => ipcRenderer.invoke('stop-udp-server'),
   startRtmpServer: (port: number) => ipcRenderer.invoke('start-rtmp-server', port),
-  stopRtmpServer: () => ipcRenderer.invoke('stop-rtmp-server'),
+  stopRtmpServer: async () => await ipcRenderer.invoke('stop-rtmp-server'),
   getServerStatus: () => ipcRenderer.invoke('get-server-status'),
   setAppLanguage: (language: string) => ipcRenderer.invoke('set-app-language', language),
   getlocalAddresses: () => ipcRenderer.invoke('get-local-ips'),
