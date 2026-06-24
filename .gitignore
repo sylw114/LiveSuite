@@ -19,6 +19,13 @@ Thumbs.db
 # Generated Licenses
 licenses/
 
+# IDE
+.idea/
+.vscode/
+
+
 # for Agents
 AGENTS.md
 CLAUDE.md
+.claude/
+.atomcode/

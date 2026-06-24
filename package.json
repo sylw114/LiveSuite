@@ -25,7 +25,8 @@
         "from": "./subbuild/",
         "to": "subbuild",
         "filter": [
-          "*.exe"
+          "*.exe",
+          "*.md"
         ]
       },
       {
