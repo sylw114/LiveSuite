@@ -2,11 +2,16 @@ import { app, BrowserWindow, ipcMain, shell, dialog, Menu } from 'electron';
 import { spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import fs from 'fs';
-import NodeMediaServer from 'node-media-server';
+import {
+  createStreamServer,
+  DeclarativeStreamServer,
+  RtmpProtocol,
+  StreamServerDeclaration,
+} from '@livesuite/stream-server';
 
 let mainWindow: BrowserWindow | null;
 let udpServer: ChildProcess | null = null;
-let rtmpServer: NodeMediaServer | null = null;
+let rtmpServer: DeclarativeStreamServer | null = null;
 let udpRunning = false;
 let rtmpRunning = false;
 let isHighLatency = false;
@@ -259,7 +264,7 @@ ipcMain.handle('get-license-content', (_, type: 'summary' | 'full') => {
   }
 });
 
-ipcMain.handle('start-rtmp-server', (_, port) => {
+ipcMain.handle('start-rtmp-server', async(_, port) => {
   if (rtmpRunning) return;
 
   const rtmpPort = parseInt(port, 10);
@@ -270,56 +275,55 @@ ipcMain.handle('start-rtmp-server', (_, port) => {
   activePublishers = new Map();
   activeViewers = new Map();
 
-  rtmpServer = new NodeMediaServer({
-    rtmp: {
-      port: rtmpPort,
-      chunk_size: 30000,
-      gop_cache: false,
-      ping: 30,
-      ping_timeout: 60
-    }
-  });
+  const declaration: StreamServerDeclaration = {
+    name: 'LiveSuite RTMP Server',
+    protocols: {
+      rtmp: RtmpProtocol.declare({
+        port: rtmpPort,
+        chunkSize: 30000,
+        gopCache: false,
+        pingSeconds: 30,
+        pingTimeoutSeconds: 60,
+        publish: true,
+        play: true,
+      }),
+    },
+  };
 
-  rtmpServer.on('serverError', (err) => {
-    console.error(err);
+  rtmpServer = createStreamServer(declaration);
+  rtmpServer.on('error', (event) => {
+    console.error(event.error);
     rtmpRunning = false;
     rtmpServer = null;
     updateStatus();
     dialog.showErrorBox(mainT('rtmpErrorTitle'), mainT('rtmpStartFailed'));
   });
 
-  rtmpServer.on('postPublish', (session) => {
-    const streamPath = session.streamPath;
-    const id = session.id;
-    console.log(`[NodeMediaServer] Stream published: ${streamPath}`);
-    activePublishers.set(id, { streamPath });
+  rtmpServer.on('published', (event) => {
+    console.log(`[StreamServer] Stream published: ${event.session.streamPath}`);
+    activePublishers.set(event.session.id, { streamPath: event.session.streamPath });
     broadcastRtmpConnections();
   });
 
-  rtmpServer.on('donePublish', (session) => {
-    const id = session.id;
-    console.log(`[NodeMediaServer] Stream donePublish: ${session.streamPath}`);
-    activePublishers.delete(id);
+  rtmpServer.on('publish-ended', (event) => {
+    console.log(`[StreamServer] Stream publish ended: ${event.session.streamPath}`);
+    activePublishers.delete(event.session.id);
     broadcastRtmpConnections();
   });
 
-  rtmpServer.on('postPlay', (session) => {
-    const streamPath = session.streamPath;
-    const viewerId = session.id;
-    const ip = getViewerIp(session);
-    console.log(`[NodeMediaServer] Viewer connected: ${streamPath} (${ip})`);
-    activeViewers.set(viewerId, { streamPath, ip });
+  rtmpServer.on('player-connected', (event) => {
+    console.log(`[StreamServer] Viewer connected: ${event.session.streamPath} (${event.session.ip})`);
+    activeViewers.set(event.session.id, { streamPath: event.session.streamPath, ip: event.session.ip });
     broadcastRtmpConnections();
   });
 
-  rtmpServer.on('donePlay', (session) => {
-    const viewerId = session.id;
-    console.log(`[NodeMediaServer] Viewer disconnected: ${session.streamPath}`);
-    activeViewers.delete(viewerId);
+  rtmpServer.on('player-disconnected', (event) => {
+    console.log(`[StreamServer] Viewer disconnected: ${event.session.streamPath}`);
+    activeViewers.delete(event.session.id);
     broadcastRtmpConnections();
   });
 
-  rtmpServer.run();
+  await rtmpServer.start();
   rtmpRunning = true;
   updateStatus();
 });

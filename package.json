@@ -52,6 +52,6 @@
     "typescript": "^5.0.0"
   },
   "dependencies": {
-    "node-media-server": "^4.2.4"
+    "@livesuite/stream-server": "file:stream-server"
   }
 }
