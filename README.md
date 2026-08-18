@@ -1,20 +1,20 @@
 # 直播套件，搭配[VideoStreamer](https://github.com/sylw114/AndroidVideoStreamer/)使用
 
-它提供了rtmp流服务器和一个低延迟音频服务器（后者仅本程序提供）。在测试平台上可以达到约90ms的音频延迟。不过需要开启一些以音质和音频稳定性为代价的选项。如果不开启，延迟会逐渐从90ms开始增长，这是因为延迟取决于最慢的一个包，而最慢的包可能变得更慢。
+它提供了rtmp流服务器、自制内外视频协议的流服务器和一个低延迟音频服务器（除首项仅本程序提供）。在测试平台上可以达到约90ms（udp模式）/110ms（quic可靠流模式音频更稳定）的音频延迟。
 
-它可以搭配[wasapi_relink](https://github.com/Litttlefish/wasapi_relink)使用以进一步降低音频延迟，但实际效果取决于你的设备，并效果不大（十几毫秒）
+它可以搭配[wasapi_relink](https://github.com/Litttlefish/wasapi_relink)使用以进一步降低音频延迟，但实际效果取决于你的设备，并效果不大（几毫秒）
 
-它使用了重排序以提高音频稳定性，在拥有足够冗余缓冲数据时，会将乱序音频重组成正常顺序的音频。但是你也可以禁用这一条（开启丢弃乱序包选项），以获取轻微的延迟提升。
+udp模式使用了重排序以提高音频稳定性，在拥有足够冗余缓冲数据时，会将乱序音频重组成正常顺序的音频。但是你也可以禁用这一条（开启丢弃乱序包选项），以获取轻微的延迟提升。
 
 ## 低延迟视频输出
 
-LiveSuite 专属的 QUIC/UDP 视频接收端默认只提供可拉取的 HTTP-FLV，不在界面内解码画面，也不会把每次推流自动写成文件。地址格式为：
+LiveSuite 专属的 QUIC/UDP 视频接收端默认只提供可拉取的 HTTP-FLV。地址格式为：
 
 ```text
 http://<LiveSuite IP>:<HTTP 输出端口>/<推流路径>.flv
 ```
 
-例如 `/phone/stream` 在默认端口上的本机地址是 `http://localhost:8080/phone/stream.flv`。该地址可用于 ffplay、VLC，或 OBS 的“媒体源”（关闭“本地文件”后填入 URL）。
+例如 `/phone/stream` 在默认端口上的本机地址是 `http://localhost:8080/phone/stream.flv`。该地址可用于 ffplay、VLC，或 OBS 的“浏览器”。
 
 视频服务运行后，每条推流都可独立开始或结束 MP4 录制，不需要中断其他流。每条流也有独立的滚动回放缓存和缓存时长，可按需将最近一段画面保存成 MP4；断流后已形成的可解码缓存仍可单独保存或释放。两类文件都保存在系统“视频/LiveSuite/Recordings”目录。
 
