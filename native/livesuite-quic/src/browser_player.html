@@ -1,0 +1,712 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>LiveSuite Player</title>
+  <style>
+    html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
+    body { display: grid; place-items: center; }
+    #grid { display: grid; width: 100vw; height: 100vh; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 4px; background: #000; }
+    canvas { display: block; width: 100%; height: 100%; background: #000; }
+  </style>
+</head>
+<body>
+  <div id="grid"></div>
+  <script>
+  (() => {
+    'use strict';
+
+    // ============ 共享服务端时钟 ============
+    // 时钟同步由服务端与拉流网页共同完成：服务端把每条流的采集时刻预测到
+    // 服务端墙钟（FLV 时间戳已落在服务端时钟轴上），并给出保证各流平滑
+    // 播放的对齐延迟；网页定期拉取同步信息，把服务端时钟换算回本机时钟
+    // 后统一调度所有流的播放时刻。
+    const SYNC_URL = '/livesuite/sync-info';
+    const SYNC_POLL_MS = 1000;
+    const TARGET_LATENCY_MS = 180;
+    const MAX_VIDEO_INPUT = 300;
+    const MAX_VIDEO_OUTPUT = 300;
+    const MAX_AUDIO_INPUT = 300;
+
+    // 服务端时钟估算：offset = serverEpochMs - performance.now()。多次取样
+    // 后取最小 RTT 的样本，降低网络抖动对时钟换算的影响。
+    let serverOffsetMs = null;
+    let alignmentDelayMs = TARGET_LATENCY_MS;
+    let synchronizeEnabled = false;
+    let syncInfoReady = false;
+    const originByPath = new Map();
+    const playerSessions = [];
+    let syncSamples = [];
+    const pageParams = new URLSearchParams(location.search);
+    const parsedLatentMs = Number(pageParams.get('latent'));
+    // latent 只影响网页端的显示调度,不参与服务端拉流或时钟预测。
+    const EXTRA_LATENT_MS = Number.isFinite(parsedLatentMs)
+      ? Math.min(60_000, Math.max(0, parsedLatentMs))
+      : 0;
+
+    function playbackLatencyMs() {
+      return Math.max(0, alignmentDelayMs) + EXTRA_LATENT_MS;
+    }
+
+    function refreshSyncInfo() {
+      const t0 = performance.now();
+      fetch(SYNC_URL + '?t0=' + encodeURIComponent(t0), { cache: 'no-store' })
+        .then((response) => response.ok ? response.json() : null)
+        .then((info) => {
+          if (!info) return;
+          const t1 = performance.now();
+          const previousSynchronize = synchronizeEnabled;
+          syncInfoReady = true;
+          synchronizeEnabled = Boolean(info.synchronize);
+          if (Number.isFinite(info.alignmentDelayMs) && info.alignmentDelayMs > 0) {
+            alignmentDelayMs = info.alignmentDelayMs;
+          }
+          if (Array.isArray(info.streams)) {
+            originByPath.clear();
+            for (const entry of info.streams) {
+              if (typeof entry.path === 'string' && Number.isFinite(entry.originServerMs) && entry.originServerMs > 0) {
+                originByPath.set(entry.path, entry.originServerMs);
+              }
+            }
+          }
+          const serverReceiveMs = Number.isFinite(info.serverReceiveEpochMs)
+            ? info.serverReceiveEpochMs : info.serverEpochMs;
+          const serverSendMs = Number.isFinite(info.serverSendEpochMs)
+            ? info.serverSendEpochMs : serverReceiveMs;
+          if (Number.isFinite(serverReceiveMs) && Number.isFinite(serverSendMs)) {
+            // HTTP 四时间点协商:服务端返回处理前后的 t1/t2,网页用 t0/t3
+            // 的中点估计服务端墙钟,避免把单向网络延迟当成时钟偏移。
+            syncSamples.push({
+              offset: (serverReceiveMs + serverSendMs) / 2 - (t0 + t1) / 2,
+              rtt: t1 - t0,
+            });
+            if (syncSamples.length > 8) syncSamples.shift();
+            let best = null;
+            for (const sample of syncSamples) {
+              if (!best || sample.rtt < best.rtt) best = sample;
+            }
+            if (best) serverOffsetMs = best.offset;
+          }
+          if (previousSynchronize !== synchronizeEnabled) {
+            for (const session of playerSessions) session.resetForRealignment();
+          }
+        })
+        .catch(() => {});
+    }
+    refreshSyncInfo();
+    setInterval(refreshSyncInfo, SYNC_POLL_MS);
+
+    function setStatus(value, isError) {
+      if (isError) console.warn('[LiveSuite]', value);
+    }
+
+    function u24(data, offset) {
+      return (data[offset] << 16) | (data[offset + 1] << 8) | data[offset + 2];
+    }
+
+    function u32(data, offset) {
+      return (data[offset] * 0x1000000) + (data[offset + 1] << 16) +
+        (data[offset + 2] << 8) + data[offset + 3];
+    }
+
+    function signed24(data, offset) {
+      const value = u24(data, offset);
+      return (value & 0x800000) ? value - 0x1000000 : value;
+    }
+
+    function appendBytes(left, right) {
+      const result = new Uint8Array(left.length + right.length);
+      result.set(left);
+      result.set(right, left.length);
+      return result;
+    }
+
+    function avccDescriptionKey(data) {
+      return Array.from(data).join(',');
+    }
+
+    function makeAvcCodec(data) {
+      if (data.length < 4) throw new Error('AVC 配置过短');
+      return 'avc1.' + [data[1], data[2], data[3]]
+        .map((value) => value.toString(16).padStart(2, '0')).join('');
+    }
+
+    function parseAudioConfig(data, stereoHint) {
+      if (data.length < 2) throw new Error('AAC 配置过短');
+      let objectType = data[0] >> 3;
+      let frequencyIndex = ((data[0] & 7) << 1) | (data[1] >> 7);
+      let bitOffset = 13;
+      if (objectType === 31) {
+        if (data.length < 3) throw new Error('AAC 扩展配置过短');
+        objectType = 32 + ((data[1] & 0x7f) << 3) | (data[2] >> 5);
+        bitOffset = 18;
+      }
+      const sampleRates = [96000, 88200, 64000, 48000, 44100, 32000, 24000,
+        22050, 16000, 12000, 11025, 8000, 7350];
+      let sampleRate;
+      if (frequencyIndex === 15) {
+        const byteOffset = Math.floor(bitOffset / 8);
+        if (data.length < byteOffset + 3) throw new Error('AAC 采样率配置过短');
+        sampleRate = (data[byteOffset] << 16) | (data[byteOffset + 1] << 8) | data[byteOffset + 2];
+      } else {
+        sampleRate = sampleRates[frequencyIndex];
+      }
+      const channelConfig = (data[1] >> 3) & 0x0f;
+      const channels = [0, 1, 2, 3, 4, 5, 6, 0][channelConfig] || (stereoHint ? 2 : 1);
+      if (!sampleRate || !channels) throw new Error('AAC 音频布局不受支持');
+      return {
+        data: data.slice(),
+        codec: 'mp4a.40.' + objectType,
+        sampleRate,
+        channels,
+        key: avccDescriptionKey(data) + ':' + channels
+      };
+    }
+
+    function decodeStreamPath(value) {
+      try { return decodeURIComponent(value); } catch (_) { return value; }
+    }
+
+    // ============ 单流播放会话 ============
+    class StreamSession {
+      constructor(streamPath, flvUrl, canvas) {
+        this.streamPath = streamPath;       // 解码后的流路径，用于匹配 sync-info
+        this.flvUrl = flvUrl;
+        this.canvas = canvas;
+        this.context = canvas.getContext('2d', { alpha: false });
+        this.running = true;
+        this.fatal = false;
+        this.reconnectTimer = 0;
+        this.abortController = null;
+        this.loopPromise = null;
+        this.flvHeaderRead = false;
+        this.videoConfig = null;
+        this.videoConfigKey = '';
+        this.videoDecoder = null;
+        this.videoInput = [];
+        this.videoFrames = [];
+        this.waitingForKeyframe = true;
+        this.decoderGeneration = 0;
+        this.mediaBaseUs = null;
+        this.startPerfMs = null;
+        this.lastInputPtsUs = null;
+        this.lastDisplayedPtsUs = null;
+        this.renderedFrames = 0;
+        this.droppedFrames = 0;
+        this.audioContext = null;
+        this.audioConfig = null;
+        this.audioConfigKey = '';
+        this.audioDecoder = null;
+        this.audioInput = [];
+        this.audioBaseContextTime = null;
+        this.audioScheduleCursor = 0;
+        this.lastAudioPtsUs = null;
+      }
+
+      setFatal(message) {
+        this.fatal = true;
+        this.running = false;
+        setStatus(message, true);
+      }
+
+      closeVideoDecoder() {
+        this.decoderGeneration++;
+        if (this.videoDecoder) {
+          try { this.videoDecoder.close(); } catch (_) {}
+        }
+        this.videoDecoder = null;
+        this.videoInput = [];
+        for (const frame of this.videoFrames) {
+          try { frame.close(); } catch (_) {}
+        }
+        this.videoFrames = [];
+      }
+
+      closeAudioDecoder() {
+        if (this.audioDecoder) {
+          try { this.audioDecoder.close(); } catch (_) {}
+        }
+        this.audioDecoder = null;
+        this.audioInput = [];
+        this.audioBaseContextTime = null;
+        this.audioScheduleCursor = 0;
+        this.lastAudioPtsUs = null;
+      }
+
+      resetPipeline() {
+        this.closeVideoDecoder();
+        this.closeAudioDecoder();
+        this.flvHeaderRead = false;
+        this.videoConfig = null;
+        this.videoConfigKey = '';
+        this.audioConfig = null;
+        this.audioConfigKey = '';
+        this.waitingForKeyframe = true;
+        this.mediaBaseUs = null;
+        this.startPerfMs = null;
+        this.lastInputPtsUs = null;
+        this.lastDisplayedPtsUs = null;
+        if (this.context) this.context.clearRect(0, 0, this.canvas.width, this.canvas.height);
+      }
+
+      resetForRealignment() {
+        // 保留当前 FLV 中已经收到的音视频配置,只清掉编码帧和时间轴;
+        // 这样运行中切换同步开关时无需等待服务端再次发送配置帧。
+        this.closeVideoDecoder();
+        this.closeAudioDecoder();
+        this.waitingForKeyframe = true;
+        this.mediaBaseUs = null;
+        this.startPerfMs = null;
+        this.lastInputPtsUs = null;
+        this.lastDisplayedPtsUs = null;
+        if (this.context) this.context.clearRect(0, 0, this.canvas.width, this.canvas.height);
+        setStatus('正在重新对齐播放器时钟…');
+      }
+
+      // 建立播放时间轴：FLV 时间戳已落在服务端时钟轴（首帧即流的服务端
+      // 采集起点 + 相对偏移）。同步开启且已知起点时，把首帧的显示时刻设为
+      // 「服务端采集时刻 + 对齐延迟」换算回本机时钟；否则退回固定延迟。
+      establishTimeline(ptsUs) {
+        if (this.mediaBaseUs !== null) return true;
+        this.mediaBaseUs = ptsUs;
+        const originServerMs = originByPath.get(this.streamPath);
+        if (!syncInfoReady || (synchronizeEnabled && (serverOffsetMs === null || !Number.isFinite(originServerMs)))) {
+          // 同步信息尚未完成时不要用本地到达时刻锁定起播点。等待下一个
+          // 关键帧，避免多路连接分别以各自的网络到达时间开始播放。
+          this.mediaBaseUs = null;
+          return false;
+        }
+        if (synchronizeEnabled && serverOffsetMs !== null && Number.isFinite(originServerMs)) {
+          const firstServerMs = originServerMs + this.mediaBaseUs / 1000;
+          this.startPerfMs = firstServerMs + playbackLatencyMs() - serverOffsetMs;
+        } else {
+          this.startPerfMs = performance.now() + playbackLatencyMs();
+        }
+        return true;
+      }
+
+      configureVideo(data) {
+        const key = avccDescriptionKey(data);
+        if (key === this.videoConfigKey && this.videoDecoder) return;
+        this.videoConfig = data.slice();
+        this.videoConfigKey = key;
+        this.closeVideoDecoder();
+        if (typeof VideoDecoder === 'undefined' || typeof EncodedVideoChunk === 'undefined') {
+          this.setFatal('此浏览器不支持 WebCodecs 视频解码');
+          return;
+        }
+        const generation = this.decoderGeneration;
+        try {
+          this.videoDecoder = new VideoDecoder({
+            output: (frame) => {
+              if (generation !== this.decoderGeneration) {
+                frame.close();
+                return;
+              }
+              this.videoFrames.push(frame);
+              while (this.videoFrames.length > MAX_VIDEO_OUTPUT) {
+                const dropped = this.videoFrames.shift();
+                if (dropped) {
+                  try { dropped.close(); } catch (_) {}
+                }
+                this.droppedFrames++;
+              }
+              this.pumpVideo();
+            },
+            error: () => {
+              if (generation !== this.decoderGeneration || this.fatal) return;
+              setStatus('视频解码异常，等待下一个关键帧…', true);
+              this.waitingForKeyframe = true;
+              this.closeVideoDecoder();
+            }
+          });
+          this.videoDecoder.configure({
+            codec: makeAvcCodec(this.videoConfig),
+            description: this.videoConfig.slice().buffer
+          });
+          this.waitingForKeyframe = true;
+        } catch (error) {
+          this.setFatal('无法配置 H.264 解码器：' + error.message);
+        }
+      }
+
+      pumpVideo() {
+        if (!this.videoDecoder || this.fatal) return;
+        while (this.videoInput.length && this.videoDecoder.decodeQueueSize < 8) {
+          const item = this.videoInput.shift();
+          try {
+            this.videoDecoder.decode(new EncodedVideoChunk({
+              type: item.key ? 'key' : 'delta',
+              timestamp: item.timestampUs,
+              data: item.data
+            }));
+          } catch (_) {
+            this.waitingForKeyframe = true;
+            setStatus('视频帧已跳过，等待关键帧…', true);
+            break;
+          }
+        }
+      }
+
+      enqueueVideo(timestampUs, key, data) {
+        if (this.fatal || !data.length) return;
+        // 重连或网络追赶时,已经显示过的编码分片没有再送入解码器的价值。
+        // 渲染队列还会继续丢弃已过播放时刻的解码帧,两层都限制旧数据堆积。
+        if (this.lastDisplayedPtsUs !== null && timestampUs <= this.lastDisplayedPtsUs) {
+          this.droppedFrames++;
+          return;
+        }
+        if (this.lastInputPtsUs !== null && timestampUs + 1000000 < this.lastInputPtsUs) {
+          if (!key) return;
+          this.closeVideoDecoder();
+          if (this.videoConfig) this.configureVideo(this.videoConfig);
+          this.mediaBaseUs = null;
+          this.startPerfMs = null;
+          this.lastInputPtsUs = timestampUs;
+          this.waitingForKeyframe = true;
+        }
+        this.lastInputPtsUs = Math.max(this.lastInputPtsUs === null ? timestampUs : this.lastInputPtsUs, timestampUs);
+        if (this.waitingForKeyframe && !key) return;
+        if (key) {
+          if (!this.establishTimeline(timestampUs)) return;
+          this.waitingForKeyframe = false;
+        }
+        if (!this.videoDecoder && this.videoConfig) this.configureVideo(this.videoConfig);
+        if (!this.videoDecoder) return;
+        this.videoInput.push({ timestampUs, key, data: data.slice() });
+        if (this.videoInput.length > MAX_VIDEO_INPUT) {
+          const lastKey = this.videoInput.map((item) => item.key).lastIndexOf(true);
+          if (lastKey >= 0) {
+            this.videoInput = this.videoInput.slice(lastKey);
+          } else {
+            this.videoInput = this.videoInput.slice(-MAX_VIDEO_INPUT);
+          }
+        }
+        this.pumpVideo();
+        setStatus('播放中');
+      }
+
+      createAudioContextIfNeeded() {
+        if (this.audioContext) return this.audioContext;
+        const Context = window.AudioContext || window.webkitAudioContext;
+        if (!Context) return null;
+        try {
+          this.audioContext = new Context();
+          this.audioContext.resume().catch(() => {});
+        } catch (_) {
+          this.audioContext = null;
+        }
+        return this.audioContext;
+      }
+
+      configureAudio() {
+        if (!this.audioConfig || this.audioDecoder || typeof AudioDecoder === 'undefined') return;
+        if (typeof EncodedAudioChunk === 'undefined') return;
+        if (!this.createAudioContextIfNeeded()) return;
+        try {
+          this.audioDecoder = new AudioDecoder({
+            output: (audioData) => this.scheduleAudio(audioData),
+            error: () => {
+              if (!this.fatal) setStatus('音频解码不可用，视频仍可继续播放');
+              this.closeAudioDecoder();
+            }
+          });
+          this.audioDecoder.configure({
+            codec: this.audioConfig.codec,
+            description: this.audioConfig.data.slice().buffer,
+            sampleRate: this.audioConfig.sampleRate,
+            numberOfChannels: this.audioConfig.channels
+          });
+        } catch (_) {
+          this.closeAudioDecoder();
+          setStatus('音频解码不可用，视频仍可继续播放');
+        }
+      }
+
+      pumpAudio() {
+        if (!this.audioDecoder || !this.audioContext || this.fatal) return;
+        while (this.audioInput.length && this.audioDecoder.decodeQueueSize < 8) {
+          const item = this.audioInput.shift();
+          try {
+            this.audioDecoder.decode(new EncodedAudioChunk({
+              type: 'key', timestamp: item.timestampUs, data: item.data
+            }));
+          } catch (_) {
+            this.audioInput = [];
+            break;
+          }
+        }
+      }
+
+      scheduleAudio(audioData) {
+        if (!this.audioContext || this.audioContext.state !== 'running' || this.mediaBaseUs === null) {
+          audioData.close();
+          return;
+        }
+        try {
+          const channels = Math.min(audioData.numberOfChannels, 8);
+          const buffer = this.audioContext.createBuffer(channels, audioData.numberOfFrames, audioData.sampleRate);
+          for (let channel = 0; channel < channels; channel++) {
+            const samples = new Float32Array(audioData.numberOfFrames);
+            audioData.copyTo(samples, { planeIndex: channel, format: 'f32-planar' });
+            buffer.copyToChannel(samples, channel);
+          }
+          const timestampUs = Number.isFinite(audioData.timestamp) ? audioData.timestamp : this.mediaBaseUs;
+          if (this.lastAudioPtsUs !== null && timestampUs < this.lastAudioPtsUs) {
+            audioData.close();
+            return;
+          }
+          this.lastAudioPtsUs = timestampUs;
+          const relativeSeconds = (timestampUs - this.mediaBaseUs) / 1000000;
+          if (this.audioBaseContextTime === null) {
+            const videoDelay = Math.max(0, ((this.startPerfMs || performance.now()) - performance.now()) / 1000);
+            this.audioBaseContextTime = this.audioContext.currentTime + Math.max(0.03, videoDelay) - relativeSeconds;
+          }
+          let startAt = this.audioBaseContextTime + relativeSeconds;
+          const earliest = this.audioContext.currentTime + 0.02;
+          if (startAt < earliest) {
+            const shift = earliest - startAt;
+            this.audioBaseContextTime += shift;
+            this.startPerfMs = (this.startPerfMs || performance.now()) + shift * 1000;
+            startAt += shift;
+          }
+          startAt = Math.max(startAt, this.audioScheduleCursor);
+          const source = this.audioContext.createBufferSource();
+          source.buffer = buffer;
+          source.connect(this.audioContext.destination);
+          source.onended = () => source.disconnect();
+          source.start(startAt);
+          this.audioScheduleCursor = startAt + buffer.duration;
+        } catch (_) {
+          // 音频是可选轨道，音频转换失败不影响视频画面。
+        } finally {
+          audioData.close();
+        }
+      }
+
+      handleVideoTag(tag) {
+        if (tag.data.length < 5 || (tag.data[0] & 0x0f) !== 7) return;
+        const packetType = tag.data[1];
+        if (packetType === 0) {
+          this.configureVideo(tag.data.slice(5));
+          return;
+        }
+        if (packetType !== 1 || tag.data.length <= 5) return;
+        const compositionUs = signed24(tag.data, 2) * 1000;
+        const timestampUs = tag.timestampUs + compositionUs;
+        this.enqueueVideo(timestampUs, (tag.data[0] >> 4) === 1, tag.data.slice(5));
+      }
+
+      handleAudioTag(tag) {
+        if (!tag.data.length || (tag.data[0] >> 4) !== 10 || tag.data.length < 2) return;
+        const packetType = tag.data[1];
+        if (packetType === 0) {
+          try {
+            const next = parseAudioConfig(tag.data.slice(2), Boolean(tag.data[0] & 1));
+            if (next.key !== this.audioConfigKey) {
+              this.closeAudioDecoder();
+              this.audioConfig = next;
+              this.audioConfigKey = next.key;
+              this.configureAudio();
+            }
+          } catch (_) {
+            this.audioConfig = null;
+          }
+          return;
+        }
+        if (packetType !== 1 || !this.audioConfig || tag.data.length <= 2) return;
+        if (!this.audioDecoder) this.configureAudio();
+        if (!this.audioDecoder) return;
+        this.audioInput.push({ timestampUs: tag.timestampUs, data: tag.data.slice(2) });
+        if (this.audioInput.length > MAX_AUDIO_INPUT) this.audioInput = this.audioInput.slice(-30);
+        this.pumpAudio();
+      }
+
+      handleTag(tag) {
+        if (!tag || !tag.type) return;
+        if (tag.type === 9) this.handleVideoTag(tag);
+        else if (tag.type === 8) this.handleAudioTag(tag);
+      }
+
+      renderFrame(now) {
+        if (this.mediaBaseUs !== null && this.startPerfMs !== null) {
+          // 初始快照 GOP 或网络抖动可能堆积较多帧，检测到积压时动态追帧，防止持续延迟或溢出
+          if (EXTRA_LATENT_MS === 0 && this.videoFrames.length > 8) {
+            const catchupUs = (this.videoFrames.length - 3) * 8000;
+            this.startPerfMs -= catchupUs / 1000;
+          }
+          let targetPtsUs = this.mediaBaseUs + (now - this.startPerfMs) * 1000;
+          if (this.lastInputPtsUs !== null && targetPtsUs > this.lastInputPtsUs + 500000) {
+            this.startPerfMs = now - (this.lastInputPtsUs - this.mediaBaseUs) / 1000 + playbackLatencyMs();
+            targetPtsUs = this.mediaBaseUs + (now - this.startPerfMs) * 1000;
+          }
+          let selected = null;
+          while (this.videoFrames.length && Number(this.videoFrames[0].timestamp) <= targetPtsUs) {
+            if (selected) {
+              selected.close();
+            }
+            selected = this.videoFrames.shift();
+          }
+          if (selected) {
+            if (this.canvas.width !== selected.displayWidth || this.canvas.height !== selected.displayHeight) {
+              this.canvas.width = selected.displayWidth;
+              this.canvas.height = selected.displayHeight;
+            }
+            this.context.drawImage(selected, 0, 0, this.canvas.width, this.canvas.height);
+            if (this.lastDisplayedPtsUs !== null && Number(selected.timestamp) < this.lastDisplayedPtsUs) {
+              this.droppedFrames++;
+            }
+            this.lastDisplayedPtsUs = Number(selected.timestamp);
+            this.renderedFrames++;
+            selected.close();
+          }
+        }
+      }
+
+      readFlvTag(buffer) {
+        if (!this.flvHeaderRead) {
+          if (buffer.length < 13) return null;
+          if (buffer[0] !== 0x46 || buffer[1] !== 0x4c || buffer[2] !== 0x56 || buffer[3] !== 1) {
+            throw new Error('FLV 头无效');
+          }
+          const offset = u32(buffer, 5);
+          if (offset > 1024 * 1024) throw new Error('FLV 头偏移过大');
+          if (buffer.length < offset + 4) return null;
+          this.flvHeaderRead = true;
+          return { consumed: offset + 4 };
+        }
+        if (buffer.length < 15) return null;
+        const dataSize = u24(buffer, 1);
+        const total = 11 + dataSize + 4;
+        if (buffer.length < total) return null;
+        const timestamp = u24(buffer, 4) + buffer[7] * 0x1000000;
+        return {
+          consumed: total,
+          type: buffer[0],
+          timestampUs: timestamp * 1000,
+          data: buffer.slice(11, 11 + dataSize)
+        };
+      }
+
+      async readConnection() {
+        this.abortController = new AbortController();
+        const response = await fetch(this.flvUrl, {
+          cache: 'no-store',
+          signal: this.abortController.signal,
+          headers: { Accept: 'video/x-flv' }
+        });
+        if (!response.ok) throw new Error('等待视频流（HTTP ' + response.status + '）');
+        if (!response.body) throw new Error('浏览器不支持流式 HTTP 响应');
+        this.resetPipeline();
+        setStatus('已连接，等待关键帧…');
+        const reader = response.body.getReader();
+        let buffer = new Uint8Array(0);
+        try {
+          while (this.running) {
+            const result = await reader.read();
+            if (result.done) break;
+            if (result.value) buffer = appendBytes(buffer, result.value);
+            while (buffer.length) {
+              const tag = this.readFlvTag(buffer);
+              if (!tag) break;
+              buffer = buffer.slice(tag.consumed);
+              this.handleTag(tag);
+            }
+          }
+        } finally {
+          reader.releaseLock();
+        }
+        throw new Error('视频连接已结束');
+      }
+
+      runConnections() {
+        if (this.loopPromise) return this.loopPromise;
+        this.loopPromise = (async () => {
+          let delay = 100;
+          while (this.running && !this.fatal) {
+            try {
+              await this.readConnection();
+              delay = 100;
+            } catch (error) {
+              if (!this.running || this.fatal || error.name === 'AbortError') break;
+              this.resetPipeline();
+              setStatus(error.message + '，正在重连…');
+              await new Promise((resolve) => { this.reconnectTimer = setTimeout(resolve, delay); });
+              delay = Math.min(delay * 2, 2000);
+            }
+          }
+        })().finally(() => { this.loopPromise = null; });
+        return this.loopPromise;
+      }
+
+      resumeAudioFromUserGesture() {
+        const context = this.createAudioContextIfNeeded();
+        if (!context) return;
+        if (context.state === 'running') {
+          if (this.audioConfig && !this.audioDecoder) this.configureAudio();
+          return;
+        }
+        context.resume().then(() => {
+          if (this.audioConfig) {
+            this.closeAudioDecoder();
+            this.configureAudio();
+          }
+        }).catch(() => {});
+      }
+
+      stop() {
+        this.running = false;
+        if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+        if (this.abortController) this.abortController.abort();
+        this.resetPipeline();
+        if (this.audioContext) this.audioContext.close();
+      }
+    }
+
+    // ============ 会话装配 ============
+    const grid = document.getElementById('grid');
+    const sessions = playerSessions;
+
+    // 当前页面路径即默认流（与旧版单流页面行为一致）。
+    const ownPath = decodeStreamPath(location.pathname);
+    // 页面参数只属于播放器,不传给 FLV 服务端。
+    const ownUrl = new URL(location.pathname + '.flv', location.href).href;
+
+    function makeCanvas() {
+      const canvas = document.createElement('canvas');
+      grid.appendChild(canvas);
+      return canvas;
+    }
+
+    // 每个播放器页面只拉取当前路径的一路流;多路同步由多个播放器页面
+    // 分别连接同一个服务端时间轴完成。
+    const session = new StreamSession(ownPath, ownUrl, makeCanvas());
+    sessions.push(session);
+    session.runConnections();
+
+    function render(now) {
+      for (const session of sessions) session.renderFrame(now);
+      requestAnimationFrame(render);
+    }
+
+    for (const eventName of ['pointerdown', 'keydown', 'touchstart']) {
+      window.addEventListener(eventName, () => {
+        for (const session of sessions) session.resumeAudioFromUserGesture();
+      }, { passive: true });
+    }
+
+    if (typeof VideoDecoder === 'undefined' || typeof EncodedVideoChunk === 'undefined') {
+      for (const session of sessions) {
+        session.setFatal('此浏览器不支持 WebCodecs 视频解码');
+      }
+    } else {
+      requestAnimationFrame(render);
+    }
+    window.addEventListener('beforeunload', () => {
+      for (const session of sessions) session.stop();
+    });
+  })();
+  </script>
+</body>
+</html>

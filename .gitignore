@@ -1,10 +1,14 @@
 # Dependencies
 node_modules/
+/native/livesuite-quic/target/
+/quic-recordings/
+/tmp-quic-longrun/
 package-lock.json
 
 # Build Output
 dist/
 tscdist/
+/native-bin/
 *.log
 *.exe
 *.dll
@@ -15,6 +19,7 @@ Thumbs.db
 
 # Config
 *.toml
+!/native/livesuite-quic/Cargo.toml
 
 # Generated Licenses
 licenses/

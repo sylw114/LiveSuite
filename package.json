@@ -1,14 +1,21 @@
 {
   "name": "livesuite",
-  "version": "1.0.0",
+  "productName": "LiveSuite",
+  "version": "1.1.0",
   "main": "tscdist/main/index.js",
   "scripts": {
     "start": "electron .",
     "build": "tsc",
-    "prebuild:release": "npm run licenses",
-    "predist": "npm run licenses",
+    "build:native": "call udp\\build.bat",
+    "build:stream-server": "tsc -p stream-server/tsconfig.json",
+    "build:quic:compile": "cargo build --manifest-path native/livesuite-quic/Cargo.toml --release",
+    "build:quic": "npm run build:quic:compile && node scripts/copy-quic-binary.js",
+    "build:all": "npm run build:native && npm run build:stream-server && npm run build:quic && npm run build",
+    "test:quic-timestamp": "npm run build && node scripts/test-quic-timestamp.js",
+    "build:package": "npm run build:native && npm run build:stream-server && npm run build:quic && npm run build",
+    "predist": "npm run build:package && npm run licenses",
     "dist": "electron-builder",
-    "release": "npm run build && npm run dist",
+    "release": "npm run dist",
     "licenses": "node scripts/generate-licenses.js",
     "licenses:check": "license-checker --production --json > licenses/licenses.json",
     "licenses:csv": "license-checker --production --csv > licenses/licenses.csv",
@@ -18,6 +25,7 @@
     "files": [
       "tscdist/**/*",
       "index.html",
+      "styles.css",
       "package.json"
     ],
     "extraResources": [
@@ -25,8 +33,23 @@
         "from": "./subbuild/",
         "to": "subbuild",
         "filter": [
-          "*.exe",
+          "audio_server_udp.exe",
+          "livesuite_audio_quic.dll",
           "*.md"
+        ]
+      },
+      {
+        "from": "./native-bin/",
+        "to": "subbuild",
+        "filter": [
+          "livesuite-quic-server.node"
+        ]
+      },
+      {
+        "from": "./native/livesuite-quic/src/",
+        "to": "subbuild",
+        "filter": [
+          "browser_player.html"
         ]
       },
       {
@@ -41,8 +64,18 @@
       "target": "nsis"
     },
     "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "LiveSuite",
+      "uninstallDisplayName": "LiveSuite ${version}",
+      "runAfterFinish": true,
+      "license": "LICENSE",
       "differentialPackage": false,
-      "packElevateHelper": false
+      "packElevateHelper": true
     }
   },
   "devDependencies": {

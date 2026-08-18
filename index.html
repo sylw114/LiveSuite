@@ -2,179 +2,172 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Livesuite Pro</title>
-  <style>
-    body { font-family: 'Segoe UI', sans-serif; background: #1e1e1e; color: #eee; padding: 20px; }
-    .app-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 20px; }
-    .app-header h1 { margin: 0; }
-    .language-switcher { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
-    select { background: #3c3c3c; border: 1px solid #555; color: white; padding: 5px; border-radius: 4px; }
-    .card { background: #2d2d2d; padding: 15px; margin-bottom: 20px; border-radius: 8px; }
-    h2 { margin-top: 0; color: #4fc3f7; }
-    input { background: #3c3c3c; border: 1px solid #555; color: white; padding: 5px; border-radius: 4px; }
-    .field-row { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
-    .field-inline { display: inline-flex; align-items: center; gap: 6px; }
-    .actions { display: flex; align-items: center; gap: 8px; margin-top: 20px; }
-    /* Help buttons */
-    .btn-help {
-      width: 20px;
-      height: 20px;
-      border-radius: 50%;
-      border: 1px solid #777;
-      background: #444;
-      color: #eee;
-      font-size: 12px;
-      padding: 0;
-      cursor: pointer;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      line-height: 1;
-    }
-    .btn-help:hover { background: #555; }
-    button:disabled { background: #555; color: #aaa; cursor: not-allowed; }
-    .btn-start { background: #4caf50; color: white; }
-    .btn-stop { background: #f44336; color: white; }
-    #warning { color: #ff9800; font-weight: bold; margin-top: 10px; }
-    #wasapiAlert { margin-top: 15px; padding: 10px; border: 1px solid #ff9800; border-radius: 4px; display: none; }
-    #wasapiAlert button { margin-top: 10px; }
-    /* RTMP connections panel */
-    .rtmp-connections { margin-top: 15px; border-top: 1px solid #444; padding-top: 10px; }
-    .rtmp-connections h3 { margin: 0 0 10px; font-size: 14px; color: #aaa; }
-    .stream-item { background: #363636; border-radius: 6px; padding: 10px 12px; margin-bottom: 8px; }
-    .stream-header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-    .stream-path { font-family: 'Consolas', monospace; font-size: 13px; color: #4fc3f7; word-break: break-all; }
-    .stream-viewers-count { font-size: 11px; color: #aaa; }
-    .btn-sm { padding: 3px 10px; font-size: 12px; border-radius: 4px; border: none; cursor: pointer; }
-    .btn-copy { background: #2196f3; color: white; }
-    .btn-copy:hover { background: #1976d2; }
-    .btn-copy.copied { background: #4caf50; }
-    .btn-expand { background: #555; color: white; }
-    .btn-expand:hover { background: #666; }
-    .btn-show-ips { background: #9c27b0; color: white; margin-top: 10px; }
-    .btn-show-ips:hover { background: #7b1fa2; }
-    .viewer-list { margin-top: 8px; padding: 8px 12px; background: #2a2a2a; border-radius: 4px; font-family: 'Consolas', monospace; font-size: 12px; color: #bbb; }
-    .viewer-list div { padding: 2px 0; }
-    .no-streams { color: #777; font-style: italic; font-size: 13px; }
-    /* Modal overlay */
-    .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 9999; }
-    .modal-box { background: #2d2d2d; color: #eee; padding: 20px 24px; border-radius: 8px; max-width: 420px; }
-    .modal-box h3 { margin: 0 0 12px; color: #4fc3f7; }
-    .modal-box ul { margin: 0 0 16px; padding-left: 20px; }
-    .modal-box li { font-family: 'Consolas', monospace; font-size: 13px; padding: 2px 0; }
-    .modal-box .btn-close { background: #4fc3f7; color: #000; border: none; padding: 6px 20px; border-radius: 4px; cursor: pointer; }
-    .modal-box .btn-close:hover { background: #29b6f6; }
-    /* About button */
-    .btn-about {
-      background: transparent;
-      border: 1px solid #777;
-      color: #eee;
-      padding: 4px 12px;
-      border-radius: 4px;
-      cursor: pointer;
-      font-size: 13px;
-    }
-    .btn-about:hover { background: #3c3c3c; }
-    /* License dialog */
-    .license-dialog { max-width: 700px; max-height: 80vh; }
-    .license-content {
-      background: #1e1e1e;
-      border: 1px solid #444;
-      border-radius: 4px;
-      padding: 12px;
-      margin: 12px 0;
-      max-height: 50vh;
-      overflow-y: auto;
-      font-family: 'Consolas', monospace;
-      font-size: 12px;
-      line-height: 1.5;
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
-    .license-tabs {
-      display: flex;
-      gap: 8px;
-      margin-bottom: 12px;
-    }
-    .license-tab {
-      background: #3c3c3c;
-      border: 1px solid #555;
-      color: #eee;
-      padding: 4px 12px;
-      border-radius: 4px;
-      cursor: pointer;
-      font-size: 13px;
-    }
-    .license-tab.active {
-      background: #4fc3f7;
-      color: #000;
-      border-color: #4fc3f7;
-    }
-    .license-tab:hover:not(.active) { background: #4c4c4c; }
-  </style>
+  <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <header class="app-header">
-    <h1 data-i18n="appTitle">Livesuite Control</h1>
-    <div style="display: flex; align-items: center; gap: 12px;">
-      <button class="btn-about" onclick="showAboutDialog()" data-i18n="about">About</button>
-      <label class="language-switcher">
-        <span data-i18n="languageLabel">Language</span>
-        <select id="languageSelect">
-          <option value="zh-CN">中文</option>
-          <option value="en">English</option>
-        </select>
-      </label>
-    </div>
-  </header>
+  <div class="app-shell">
+    <header class="app-header">
+      <h1 data-i18n="appTitle">Livesuite Control</h1>
+      <div class="header-actions">
+        <div id="preferenceState" class="preference-state" data-i18n="preferencesSaved">Preferences saved</div>
+        <button class="btn-about" onclick="showAboutDialog()" data-i18n="about">About</button>
+        <label class="language-switcher">
+          <span data-i18n="languageLabel">Language</span>
+          <select id="languageSelect">
+            <option value="zh-CN">中文</option>
+            <option value="en">English</option>
+          </select>
+        </label>
+      </div>
+    </header>
 
-  <div class="card">
-    <h2 data-i18n="udpAudioServer">UDP Audio Server</h2>
-    <div class="field-row">
-      <label class="field-inline"><span data-i18n="tcpPort">TCP Port</span>: <input type="number" id="tcpPort" value="9000" min="1" max="65535" style="width: 80px;" oninput="if(this.value.length>5)this.value=this.value.slice(0,5)"></label>
-      <label class="field-inline"><span data-i18n="udpPort">UDP Port</span>: <input type="number" id="udpPort" value="9000" min="1" max="65535" style="width: 80px;" oninput="if(this.value.length>5)this.value=this.value.slice(0,5)"></label>
-      <label class="field-inline"><input type="checkbox" id="discardOrder" checked> <span data-i18n="discardOutOfOrder">Discard Out-of-Order</span></label>
-      <button class="btn-help" onclick="showHelp('discardHelp')" data-i18n-title="discardHelpTitle" data-i18n-aria-label="discardHelpTitle">?</button>
-    </div>
-    <div class="field-row" style="margin-top: 10px;">
-      <label class="field-inline"><span data-i18n="dropBaselineMs">Drop Baseline (ms)</span>: <input type="number" id="dropBaselineMs" value="0" min="0" style="width: 80px;"></label>
-      <button class="btn-help" onclick="showHelp('dropBaselineHelp')" data-i18n-title="dropBaselineHelpTitle" data-i18n-aria-label="dropBaselineHelpTitle">?</button>
-      <label class="field-inline"><span data-i18n="protectMs">Protect (ms)</span>: <input type="number" id="protectMs" value="50" min="0" style="width: 80px;"></label>
-      <button class="btn-help" onclick="showHelp('protectHelp')" data-i18n-title="protectHelpTitle" data-i18n-aria-label="protectHelpTitle">?</button>
-    </div>
-    <div class="actions">
-      <button id="udpStart" class="btn-start" onclick="startUdp()" data-i18n="start">Start</button>
-      <button id="udpStop" class="btn-stop" onclick="stopUdp()" disabled data-i18n="stop">Stop</button>
-    </div>
-    <div id="wasapiAlert"></div>
+    <main class="dashboard-grid">
+      <section id="quicCard" class="card card-video">
+        <div class="service-header">
+          <h2 data-i18n="lowLatencyServer">LiveSuite Low-Latency Video</h2>
+          <div id="quicStatusBadge" class="status-badge"><span id="quicStatusText" data-i18n="statusStopped">Stopped</span></div>
+        </div>
+        <p class="protocol-note" data-i18n="lowLatencyDescription">Private camera/video transport. QUIC reliable streams are primary; raw UDP uses the same media framing as a fallback.</p>
+        <div class="form-grid form-grid-video">
+          <div class="field">
+            <label class="field-label" for="quicPort" data-i18n="quicPort">QUIC Port</label>
+            <input type="number" id="quicPort" value="1935" min="1" max="65535" inputmode="numeric">
+          </div>
+          <div class="field">
+            <label class="field-label" for="quicFallbackPort" data-i18n="udpFallbackPort">UDP Fallback Port</label>
+            <input type="number" id="quicFallbackPort" value="9444" min="1" max="65535" inputmode="numeric">
+          </div>
+          <div class="field">
+            <label class="field-label" for="quicHttpPort" data-i18n="httpOutputPort">HTTP Output Port</label>
+            <input type="number" id="quicHttpPort" value="8080" min="1" max="65535" inputmode="numeric">
+          </div>
+          <div class="field">
+            <label class="field-label" for="quicMaxLatency" data-i18n="maxLatency">Latency Budget (ms)</label>
+            <input type="number" id="quicMaxLatency" value="150" min="20" max="2000" inputmode="numeric">
+          </div>
+          <div class="field">
+            <label class="field-label" for="quicReplaySeconds" data-i18n="replayBufferDuration">Default Replay Buffer (seconds)</label>
+            <input type="number" id="quicReplaySeconds" value="30" min="5" max="300" inputmode="numeric">
+          </div>
+          <div class="switch-field">
+            <label class="switch-label" for="quicSynchronizePullStreams">
+              <input type="checkbox" id="quicSynchronizePullStreams">
+              <span data-i18n="synchronizePullStreams">Synchronize pulled streams</span>
+            </label>
+          </div>
+          <div class="switch-field">
+            <label class="switch-label" for="quicIncludeAudioInPull">
+              <input type="checkbox" id="quicIncludeAudioInPull">
+              <span data-i18n="includeAudioInPull">Include audio in pull output</span>
+            </label>
+          </div>
+        </div>
+        <div class="actions">
+          <button id="quicStart" class="btn-start" onclick="startQuic()" data-i18n="start">Start</button>
+          <button id="quicStop" class="btn-stop" onclick="stopQuic()" disabled data-i18n="stop">Stop</button>
+          <button class="btn-sm btn-secondary" onclick="showQuicAddresses()" data-i18n="showPushAddresses">Show Push Addresses</button>
+          <button class="btn-sm btn-secondary" onclick="window.api.openQuicFolder()" data-i18n="openRecordings">Open Recordings</button>
+        </div>
+        <div class="details-panel" id="quicConnections">
+          <h3 data-i18n="activePublishers">Active Publishers & Diagnostics</h3>
+          <div id="quicSessionList" class="no-streams" data-i18n="noPublishers">No publishers</div>
+        </div>
+      </section>
+
+      <section id="udpCard" class="card">
+        <div class="service-header">
+          <h2 data-i18n="lowLatencyAudioServer">Low-Latency Audio Server</h2>
+          <div id="udpStatusBadge" class="status-badge"><span id="udpStatusText" data-i18n="statusStopped">Stopped</span></div>
+        </div>
+        <div class="form-grid">
+          <div class="field">
+            <label class="field-label" for="audioTransport" data-i18n="audioTransport">Transport</label>
+            <select id="audioTransport">
+              <option value="quic">QUIC Stream</option>
+              <option value="udp">UDP</option>
+            </select>
+          </div>
+          <div class="field udp-audio-only">
+            <label class="field-label" for="tcpPort" data-i18n="tcpPort">TCP Port</label>
+            <input type="number" id="tcpPort" value="9000" min="1" max="65535" inputmode="numeric">
+          </div>
+          <div class="field">
+            <label class="field-label" for="udpPort" data-i18n="audioPort">Audio Port</label>
+            <input type="number" id="udpPort" value="9000" min="1" max="65535" inputmode="numeric">
+          </div>
+          <div class="switch-field udp-audio-only">
+            <label class="switch-label" for="discardOrder">
+              <input type="checkbox" id="discardOrder" checked>
+              <span data-i18n="discardOutOfOrder">Discard Out-of-Order</span>
+            </label>
+            <button class="btn-help" onclick="showHelp('discardHelp')" data-i18n-title="discardHelpTitle" data-i18n-aria-label="discardHelpTitle">?</button>
+          </div>
+          <div class="field">
+            <div class="field-label-row">
+              <label class="field-label" for="dropBaselineMs" data-i18n="dropBaselineMs">Drop Baseline (ms)</label>
+              <button class="btn-help" onclick="showHelp('dropBaselineHelp')" data-i18n-title="dropBaselineHelpTitle" data-i18n-aria-label="dropBaselineHelpTitle">?</button>
+            </div>
+            <input type="number" id="dropBaselineMs" value="0" min="0" max="60000" inputmode="numeric">
+          </div>
+          <div class="field">
+            <div class="field-label-row">
+              <label class="field-label" for="protectMs" data-i18n="protectMs">Protect (ms)</label>
+              <button class="btn-help" onclick="showHelp('protectHelp')" data-i18n-title="protectHelpTitle" data-i18n-aria-label="protectHelpTitle">?</button>
+            </div>
+            <input type="number" id="protectMs" value="50" min="0" max="60000" inputmode="numeric">
+          </div>
+        </div>
+        <div class="actions">
+          <button id="udpStart" class="btn-start" onclick="startUdp()" data-i18n="start">Start</button>
+          <button id="udpStop" class="btn-stop" onclick="stopUdp()" disabled data-i18n="stop">Stop</button>
+        </div>
+        <div id="wasapiAlert"></div>
+      </section>
+
+      <section id="rtmpCard" class="card">
+        <div class="service-header">
+          <h2 data-i18n="rtmpServer">RTMP Server</h2>
+          <div id="rtmpStatusBadge" class="status-badge"><span id="rtmpStatusText" data-i18n="statusStopped">Stopped</span></div>
+        </div>
+        <div class="form-grid">
+          <div class="field">
+            <label class="field-label" for="rtmpPort" data-i18n="port">Port</label>
+            <input type="number" id="rtmpPort" value="1935" min="1" max="65535" inputmode="numeric">
+          </div>
+        </div>
+        <div class="actions">
+          <button id="rtmpStart" class="btn-start" onclick="startRtmp()" data-i18n="start">Start</button>
+          <button id="rtmpStop" class="btn-stop" onclick="stopRtmp()" disabled data-i18n="stop">Stop</button>
+        </div>
+        <div class="rtmp-connections is-hidden" id="rtmpConnections">
+          <h3 data-i18n="activeConnections">Active Connections</h3>
+          <div id="streamList"></div>
+          <button class="btn-sm btn-secondary" onclick="showLocalAddresses()" data-i18n="showLocalAddresses">Show Local IPs</button>
+        </div>
+      </section>
+    </main>
   </div>
 
-  <div class="card">
-    <h2 data-i18n="rtmpServer">RTMP Server</h2>
-    <div class="field-row">
-      <label class="field-inline"><span data-i18n="port">Port</span>: <input type="number" id="rtmpPort" value="1935" min="1" max="65535" style="width: 80px;" oninput="if(this.value.length>5)this.value=this.value.slice(0,5)"></label>
-    </div>
-    <div class="actions">
-      <button id="rtmpStart" class="btn-start" onclick="startRtmp()" data-i18n="start">Start</button>
-      <button id="rtmpStop" class="btn-stop" onclick="stopRtmp()" disabled data-i18n="stop">Stop</button>
-    </div>
-    <div class="rtmp-connections" id="rtmpConnections" style="display: none;">
-      <h3 data-i18n="activeConnections">Active Connections</h3>
-      <div id="streamList"></div>
-      <button class="btn-sm btn-show-ips" onclick="showLocalAddresses()" data-i18n="showLocalAddresses">Show Local IPs</button>
-    </div>
-  </div>
-
-  <div id="warning"></div>
+  <div id="warning" role="alert" aria-live="assertive"></div>
 
   <script>
     const LANGUAGE_STORAGE_KEY = 'livesuite.language';
+    const AUDIO_TRANSPORT_STORAGE_KEY = 'livesuite.audioTransport';
     const SUPPORTED_LANGUAGES = ['zh-CN', 'en'];
     const translations = {
       'zh-CN': {
         appTitle: 'Livesuite 控制台',
         languageLabel: '语言',
-        udpAudioServer: 'UDP 音频服务器',
+        preferencesSaved: '偏好已保存',
+        preferencesSaving: '正在保存',
+        preferencesError: '偏好保存失败',
+        statusRunning: '运行中',
+        statusStopped: '已停止',
+        lowLatencyAudioServer: '低延迟音频服务器',
+        audioTransport: '传输协议',
+        audioPort: '音频端口',
         tcpPort: 'TCP 端口',
         udpPort: 'UDP 端口',
         discardOutOfOrder: '丢弃乱序包',
@@ -188,11 +181,54 @@
         protectHelp: '缓存音频低于此阈值时不会丢包（毫秒）。值越高音频越平滑但延迟越高。',
         start: '启动',
         stop: '停止',
+        lowLatencyServer: 'LiveSuite 低延迟视频服务器',
+        lowLatencyDescription: 'LiveSuite 专属的通用视频传输。优先使用 QUIC 数据报；原生 UDP 使用相同媒体分片，作为低延迟回退。',
+        quicPort: 'QUIC 端口',
+        udpFallbackPort: 'UDP 回退端口',
+        httpOutputPort: 'HTTP 输出端口',
+        maxLatency: '延迟预算 (ms)',
+        replayBufferDuration: '回放缓存默认时长（秒）',
+        synchronizePullStreams: '多流拉流时间同步',
+        includeAudioInPull: '拉流包含音频',
+        sessionReplayDuration: '缓存时长（秒）',
+        startRecording: '开始录制',
+        stopRecording: '结束录制',
+        startReplayBuffer: '启动回放缓存',
+        stopReplayBuffer: '结束回放缓存',
+        saveReplay: '保存回放',
+        streamLive: '推流中',
+        streamEnded: '推流已结束',
+        endedReplayAvailable: '推流已结束，回放缓存仍可保存',
+        showPushAddresses: '显示推流地址',
+        openRecordings: '打开录像目录',
+        playbackUrl: '浏览器拉流地址',
+        copy: '复制',
+        copied: '已复制',
+        copyFailed: '无法复制地址，请手动选择。',
+        recordingFile: '录像文件',
+        activePublishers: '推流与诊断',
+        noPublishers: '暂无推流',
+        quicPortInvalid: 'QUIC 端口必须是 1 到 65535 之间的有效数字。',
+        quicFallbackPortInvalid: 'UDP 回退端口必须是 1 到 65535 之间的有效数字。',
+        httpOutputPortInvalid: 'HTTP 输出端口必须是 1 到 65535 之间的有效数字。',
+        quicPortsConflict: 'QUIC 与 UDP 回退端口不能相同。',
+        latencyBudgetInvalid: '延迟预算必须是 20 到 2000 毫秒。',
+        replayBufferDurationInvalid: '回放缓存时长必须是 5 到 300 秒。',
+        latencyRange: '端到端延迟',
+        finalLatency: '同步后最终延迟',
+        encodeAverage: '平均编码耗时',
+        encodeP95: '编码耗时 P95',
+        clockRtt: '时钟同步 RTT',
+        packetLoss: 'FEC 后残余丢片',
+        recovered: 'FEC 重建分片',
+        dropped: '丢弃帧',
+        streamRate: '接收速率',
+        pushAddressesTitle: 'LiveSuite 推流地址',
         rtmpServer: 'RTMP 服务器',
         port: '端口',
         errorPrefix: '错误：',
         tcpPortInvalid: 'TCP 端口必须是 1 到 65535 之间的有效数字。',
-        udpPortInvalid: 'UDP 端口必须是 1 到 65535 之间的有效数字。',
+        udpPortInvalid: '音频端口必须是 1 到 65535 之间的有效数字。',
         rtmpPortInvalid: 'RTMP 端口必须是 1 到 65535 之间的有效数字。',
         wasapiDllMissingTitle: '缺少 WASAPI Relink DLL。',
         wasapiDllMissingLead: '请',
@@ -221,7 +257,14 @@
       en: {
         appTitle: 'Livesuite Control',
         languageLabel: 'Language',
-        udpAudioServer: 'UDP Audio Server',
+        preferencesSaved: 'Preferences saved',
+        preferencesSaving: 'Saving preferences',
+        preferencesError: 'Could not save preferences',
+        statusRunning: 'Running',
+        statusStopped: 'Stopped',
+        lowLatencyAudioServer: 'Low-Latency Audio Server',
+        audioTransport: 'Transport',
+        audioPort: 'Audio Port',
         tcpPort: 'TCP Port',
         udpPort: 'UDP Port',
         discardOutOfOrder: 'Discard Out-of-Order',
@@ -235,11 +278,54 @@
         protectHelp: 'No packets are dropped when cached audio is below this threshold (ms). Higher values give smoother audio but higher latency.',
         start: 'Start',
         stop: 'Stop',
+        lowLatencyServer: 'LiveSuite Low-Latency Video Server',
+        lowLatencyDescription: 'LiveSuite-private general video transport. QUIC reliable streams are primary; raw UDP uses the same media framing as a low-latency fallback.',
+        quicPort: 'QUIC Port',
+        udpFallbackPort: 'UDP Fallback Port',
+        httpOutputPort: 'HTTP Output Port',
+        maxLatency: 'Latency Budget (ms)',
+        replayBufferDuration: 'Default Replay Buffer (seconds)',
+        synchronizePullStreams: 'Synchronize pulled streams',
+        includeAudioInPull: 'Include audio in pull output',
+        sessionReplayDuration: 'Buffer duration (seconds)',
+        startRecording: 'Start Recording',
+        stopRecording: 'Stop Recording',
+        startReplayBuffer: 'Start Replay Buffer',
+        stopReplayBuffer: 'Stop Replay Buffer',
+        saveReplay: 'Save Replay',
+        streamLive: 'Live',
+        streamEnded: 'Stream ended',
+        endedReplayAvailable: 'Stream ended; its replay buffer can still be saved',
+        showPushAddresses: 'Show Push Addresses',
+        openRecordings: 'Open Recordings',
+        playbackUrl: 'Browser Pull URL',
+        copy: 'Copy',
+        copied: 'Copied',
+        copyFailed: 'Could not copy the URL. Please select it manually.',
+        recordingFile: 'Recording file',
+        activePublishers: 'Publishers & Diagnostics',
+        noPublishers: 'No publishers',
+        quicPortInvalid: 'QUIC Port must be a valid number between 1 and 65535.',
+        quicFallbackPortInvalid: 'UDP fallback port must be a valid number between 1 and 65535.',
+        httpOutputPortInvalid: 'HTTP output port must be a valid number between 1 and 65535.',
+        quicPortsConflict: 'QUIC and UDP fallback ports must be different.',
+        latencyBudgetInvalid: 'Latency budget must be between 20 and 2000 ms.',
+        replayBufferDurationInvalid: 'Replay buffer duration must be between 5 and 300 seconds.',
+        latencyRange: 'End-to-end latency',
+        finalLatency: 'Final synchronized latency',
+        encodeAverage: 'Average encode time',
+        encodeP95: 'Encode time P95',
+        clockRtt: 'Clock sync RTT',
+        packetLoss: 'Residual loss after FEC',
+        recovered: 'FEC fragments rebuilt',
+        dropped: 'Dropped frames',
+        streamRate: 'Receive rate',
+        pushAddressesTitle: 'LiveSuite Push Addresses',
         rtmpServer: 'RTMP Server',
         port: 'Port',
         errorPrefix: 'Error: ',
         tcpPortInvalid: 'TCP Port must be a valid number between 1 and 65535.',
-        udpPortInvalid: 'UDP Port must be a valid number between 1 and 65535.',
+        udpPortInvalid: 'Audio Port must be a valid number between 1 and 65535.',
         rtmpPortInvalid: 'RTMP Port must be a valid number between 1 and 65535.',
         wasapiDllMissingTitle: 'WASAPI Relink DLL missing.',
         wasapiDllMissingLead: 'Please',
@@ -266,29 +352,72 @@
       }
     };
 
+    const PREFERENCE_FIELD_IDS = [
+      'audioTransport', 'tcpPort', 'udpPort', 'discardOrder', 'dropBaselineMs', 'protectMs',
+      'quicPort', 'quicFallbackPort', 'quicHttpPort', 'quicMaxLatency', 'quicReplaySeconds',
+      'quicSynchronizePullStreams', 'quicIncludeAudioInPull', 'rtmpPort'
+    ];
+
     let currentLanguage = getInitialLanguage();
     let lastWasapiStatus = null;
+    let lastQuicSessions = [];
+    let lastServerStatus = {
+      udpRunning: false,
+      rtmpRunning: false,
+      quicRunning: false
+    };
+    const pendingQuicMediaSessions = new Set();
+    const quicReplayDurationBySession = new Map();
+    let preferenceSaveTimer = null;
+    let preferencesReady = false;
+    let preferenceState = 'saved';
+    let preferenceSaveSequence = 0;
 
     window.api.onServerStatusChanged(updateUI);
     window.api.onServerWarning((msg) => { showWarning(msg); });
     window.api.onServerClear(() => { clearWarning(); });
     window.api.onWasapiStatusChanged(renderWasapiStatus);
     window.api.onRtmpConnectionsUpdated(renderRtmpConnections);
+    window.api.onQuicConnectionsUpdated(renderQuicConnections);
 
     document.getElementById('languageSelect').addEventListener('change', (event) => {
       setLanguage(event.target.value, true);
+    });
+    document.getElementById('audioTransport').addEventListener('change', () => {
+      updateAudioTransportFields(true);
     });
 
     init();
 
     async function init() {
-      setLanguage(currentLanguage, false);
-      await syncLanguageWithMain();
-      const status = await window.api.getServerStatus();
-      updateUI(status);
       enforceNumericInputs();
+      let migratedLegacyPreferences = false;
 
-      const wasapiStatus = await window.api.getWasapiStatus();
+      try {
+        const savedPreferences = await window.api.getUserPreferences();
+        migratedLegacyPreferences = migrateLegacyPreferences(savedPreferences);
+        applyPreferences(savedPreferences);
+        currentLanguage = normalizeLanguage(savedPreferences.language);
+      } catch (error) {
+        console.error('Failed to load preferences:', error);
+        showWarning(t('preferencesError'));
+      }
+
+      setLanguage(currentLanguage, false);
+      updateAudioTransportFields(false);
+      setupPreferencePersistence();
+      preferencesReady = true;
+
+      if (migratedLegacyPreferences && await persistPreferencesNow()) {
+        localStorage.removeItem(LANGUAGE_STORAGE_KEY);
+        localStorage.removeItem(AUDIO_TRANSPORT_STORAGE_KEY);
+      }
+
+      const [status, wasapiStatus] = await Promise.all([
+        window.api.getServerStatus(),
+        window.api.getWasapiStatus()
+      ]);
+      updateUI(status);
       renderWasapiStatus(wasapiStatus);
     }
 
@@ -317,19 +446,15 @@
       });
 
       if (shouldPersist) {
-        localStorage.setItem(LANGUAGE_STORAGE_KEY, currentLanguage);
-        syncLanguageWithMain();
+        void persistPreferencesNow();
       }
 
       if (lastWasapiStatus) {
         renderWasapiStatus(lastWasapiStatus);
       }
-    }
-
-    async function syncLanguageWithMain() {
-      if (window.api.setAppLanguage) {
-        await window.api.setAppLanguage(currentLanguage);
-      }
+      renderQuicConnections(lastQuicSessions);
+      updateUI(lastServerStatus);
+      renderPreferenceState();
     }
 
     function normalizeLanguage(language) {
@@ -340,18 +465,165 @@
       return translations[currentLanguage][key] || translations.en[key] || key;
     }
 
+    function migrateLegacyPreferences(preferences) {
+      let migrated = false;
+      const savedLanguage = localStorage.getItem(LANGUAGE_STORAGE_KEY);
+      const savedAudioTransport = localStorage.getItem(AUDIO_TRANSPORT_STORAGE_KEY);
+
+      if (SUPPORTED_LANGUAGES.includes(savedLanguage)) {
+        preferences.language = savedLanguage;
+        migrated = true;
+      }
+      if (savedAudioTransport === 'udp' || savedAudioTransport === 'quic') {
+        preferences.audio.transport = savedAudioTransport;
+        migrated = true;
+      }
+      return migrated;
+    }
+
+    function applyPreferences(preferences) {
+      document.getElementById('audioTransport').value = preferences.audio.transport;
+      document.getElementById('tcpPort').value = String(preferences.audio.tcpPort);
+      document.getElementById('udpPort').value = String(preferences.audio.audioPort);
+      document.getElementById('discardOrder').checked = preferences.audio.discardOutOfOrder;
+      document.getElementById('dropBaselineMs').value = String(preferences.audio.dropBaselineMs);
+      document.getElementById('protectMs').value = String(preferences.audio.protectMs);
+      document.getElementById('quicPort').value = String(preferences.video.quicPort);
+      document.getElementById('quicFallbackPort').value = String(preferences.video.udpFallbackPort);
+      document.getElementById('quicHttpPort').value = String(preferences.video.httpOutputPort);
+      document.getElementById('quicMaxLatency').value = String(preferences.video.maxLatencyMs);
+      document.getElementById('quicReplaySeconds').value = String(preferences.video.replayBufferSeconds);
+      document.getElementById('quicSynchronizePullStreams').checked = preferences.video.synchronizePullStreams === true;
+      document.getElementById('quicIncludeAudioInPull').checked = preferences.video.includeAudioInPull === true;
+      document.getElementById('rtmpPort').value = String(preferences.rtmp.port);
+    }
+
+    function setupPreferencePersistence() {
+      for (const id of PREFERENCE_FIELD_IDS) {
+        const element = document.getElementById(id);
+        element.addEventListener('change', schedulePreferenceSave);
+        if (element.type === 'number') {
+          element.addEventListener('input', schedulePreferenceSave);
+        }
+      }
+      // 多流同步可在服务运行中动态开启/关闭。
+      document.getElementById('quicSynchronizePullStreams').addEventListener('change', async (event) => {
+        if (!lastServerStatus.quicRunning) return;
+        const enabled = event.target.checked;
+        try {
+          await window.api.setQuicSynchronizePullStreams(enabled);
+        } catch (err) {
+          event.target.checked = !enabled;
+          showWarning(t('errorPrefix') + err.message);
+        }
+      });
+    }
+
+    function schedulePreferenceSave() {
+      if (!preferencesReady) return;
+      window.clearTimeout(preferenceSaveTimer);
+      preferenceState = 'saving';
+      renderPreferenceState();
+      preferenceSaveTimer = window.setTimeout(() => {
+        void persistPreferencesNow();
+      }, 350);
+    }
+
+    function collectPreferences() {
+      const tcpPort = readInteger('tcpPort', 1, 65535);
+      const audioPort = readInteger('udpPort', 1, 65535);
+      const dropBaselineMs = readInteger('dropBaselineMs', 0, 60000);
+      const protectMs = readInteger('protectMs', 0, 60000);
+      const quicPort = readInteger('quicPort', 1, 65535);
+      const udpFallbackPort = readInteger('quicFallbackPort', 1, 65535);
+      const httpOutputPort = readInteger('quicHttpPort', 1, 65535);
+      const maxLatencyMs = readInteger('quicMaxLatency', 20, 2000);
+      const replayBufferSeconds = readInteger('quicReplaySeconds', 5, 300);
+      const rtmpPort = readInteger('rtmpPort', 1, 65535);
+      if ([tcpPort, audioPort, dropBaselineMs, protectMs, quicPort, udpFallbackPort, httpOutputPort, maxLatencyMs, replayBufferSeconds, rtmpPort]
+        .some((value) => value === null)) {
+        return null;
+      }
+
+      return {
+        version: 1,
+        language: currentLanguage,
+        audio: {
+          transport: document.getElementById('audioTransport').value === 'udp' ? 'udp' : 'quic',
+          tcpPort,
+          audioPort,
+          discardOutOfOrder: document.getElementById('discardOrder').checked,
+          dropBaselineMs,
+          protectMs
+        },
+        video: {
+          quicPort,
+          udpFallbackPort,
+          httpOutputPort,
+          maxLatencyMs,
+          replayBufferSeconds,
+          synchronizePullStreams: document.getElementById('quicSynchronizePullStreams').checked,
+          includeAudioInPull: document.getElementById('quicIncludeAudioInPull').checked
+        },
+        rtmp: { port: rtmpPort }
+      };
+    }
+
+    function readInteger(id, minimum, maximum) {
+      const value = Number(document.getElementById(id).value);
+      return Number.isInteger(value) && value >= minimum && value <= maximum ? value : null;
+    }
+
+    async function persistPreferencesNow() {
+      if (!preferencesReady) return false;
+      window.clearTimeout(preferenceSaveTimer);
+      const preferences = collectPreferences();
+      if (!preferences) {
+        preferenceState = 'error';
+        renderPreferenceState();
+        return false;
+      }
+
+      const saveSequence = ++preferenceSaveSequence;
+      preferenceState = 'saving';
+      renderPreferenceState();
+      try {
+        await window.api.setUserPreferences(preferences);
+        if (saveSequence === preferenceSaveSequence) {
+          preferenceState = 'saved';
+          renderPreferenceState();
+        }
+        return true;
+      } catch (error) {
+        console.error('Failed to save preferences:', error);
+        if (saveSequence === preferenceSaveSequence) {
+          preferenceState = 'error';
+          renderPreferenceState();
+        }
+        return false;
+      }
+    }
+
+    function renderPreferenceState() {
+      const element = document.getElementById('preferenceState');
+      element.classList.toggle('saving', preferenceState === 'saving');
+      element.classList.toggle('error', preferenceState === 'error');
+      const key = preferenceState === 'saving' ? 'preferencesSaving'
+        : preferenceState === 'error' ? 'preferencesError' : 'preferencesSaved';
+      element.textContent = t(key);
+    }
+
     function showHelp(key) {
       const message = t(key);
       const overlay = document.createElement('div');
-      overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:9999;';
+      overlay.className = 'modal-overlay';
       const box = document.createElement('div');
-      box.style.cssText = 'background:#2d2d2d;color:#eee;padding:20px 24px;border-radius:8px;max-width:400px;line-height:1.5;';
+      box.className = 'modal-box';
       const text = document.createElement('p');
-      text.style.margin = '0 0 16px';
       text.textContent = message;
       const btn = document.createElement('button');
+      btn.className = 'btn-close';
       btn.textContent = 'OK';
-      btn.style.cssText = 'background:#4fc3f7;color:#000;border:none;padding:6px 20px;border-radius:4px;cursor:pointer;';
       btn.addEventListener('click', () => overlay.remove());
       box.append(text, btn);
       overlay.append(box);
@@ -360,11 +632,15 @@
     }
 
     function showWarning(message) {
-      document.getElementById('warning').innerText = message;
+      const warning = document.getElementById('warning');
+      warning.innerText = message;
+      warning.classList.add('visible');
     }
 
     function clearWarning() {
-      document.getElementById('warning').innerText = '';
+      const warning = document.getElementById('warning');
+      warning.innerText = '';
+      warning.classList.remove('visible');
     }
 
     function showValidationWarning(key) {
@@ -372,7 +648,7 @@
     }
 
     function enforceNumericInputs() {
-      ['tcpPort', 'udpPort', 'rtmpPort', 'dropBaselineMs', 'protectMs'].forEach(id => {
+      ['tcpPort', 'udpPort', 'rtmpPort', 'quicPort', 'quicFallbackPort', 'quicHttpPort', 'quicMaxLatency', 'quicReplaySeconds', 'dropBaselineMs', 'protectMs'].forEach(id => {
         const el = document.getElementById(id);
         if (el) {
           el.addEventListener('input', (e) => {
@@ -388,19 +664,56 @@
     }
 
     function updateUI(status) {
+      lastServerStatus = status;
       document.getElementById('udpStart').disabled = status.udpRunning;
       document.getElementById('udpStop').disabled = !status.udpRunning;
       document.getElementById('rtmpStart').disabled = status.rtmpRunning;
       document.getElementById('rtmpStop').disabled = !status.rtmpRunning;
+      document.getElementById('quicStart').disabled = status.quicRunning;
+      document.getElementById('quicStop').disabled = !status.quicRunning;
+      setControlsDisabled(
+        ['audioTransport', 'tcpPort', 'udpPort', 'discardOrder', 'dropBaselineMs', 'protectMs'],
+        status.udpRunning
+      );
+      setControlsDisabled([
+        'quicPort', 'quicFallbackPort', 'quicHttpPort', 'quicMaxLatency',
+        'quicIncludeAudioInPull'
+      ], status.quicRunning);
+      setControlsDisabled(['rtmpPort'], status.rtmpRunning);
+      setServiceStatus('udp', status.udpRunning);
+      setServiceStatus('quic', status.quicRunning);
+      setServiceStatus('rtmp', status.rtmpRunning);
+      document.getElementById('rtmpConnections').classList.toggle('is-hidden', !status.rtmpRunning);
+    }
+
+    function setControlsDisabled(ids, disabled) {
+      ids.forEach((id) => { document.getElementById(id).disabled = disabled; });
+    }
+
+    function setServiceStatus(service, running) {
+      document.getElementById(service + 'Card').classList.toggle('is-running', running);
+      document.getElementById(service + 'StatusBadge').classList.toggle('running', running);
+      document.getElementById(service + 'StatusText').textContent = t(running ? 'statusRunning' : 'statusStopped');
+    }
+
+    function updateAudioTransportFields(shouldPersist) {
+      const transport = document.getElementById('audioTransport').value === 'udp' ? 'udp' : 'quic';
+      document.querySelectorAll('.udp-audio-only').forEach((element) => {
+        element.classList.toggle('is-hidden', transport !== 'udp');
+      });
+      if (shouldPersist) {
+        schedulePreferenceSave();
+      }
     }
 
     async function startUdp() {
+      const transport = document.getElementById('audioTransport').value === 'udp' ? 'udp' : 'quic';
       const tcpPortVal = document.getElementById('tcpPort').value;
       const udpPortVal = document.getElementById('udpPort').value;
       const tcpPort = parseInt(tcpPortVal, 10);
       const udpPort = parseInt(udpPortVal, 10);
 
-      if (isNaN(tcpPort) || tcpPort < 1 || tcpPort > 65535) {
+      if (transport === 'udp' && (isNaN(tcpPort) || tcpPort < 1 || tcpPort > 65535)) {
         showValidationWarning('tcpPortInvalid');
         return;
       }
@@ -411,8 +724,10 @@
       clearWarning();
 
       const rawDropBaseline = Math.max(0, parseInt(document.getElementById('dropBaselineMs').value, 10) || 0);
-      const rawProtect = parseInt(document.getElementById('protectMs').value, 10) || 50;
+      const parsedProtect = parseInt(document.getElementById('protectMs').value, 10);
+      const rawProtect = Number.isNaN(parsedProtect) ? 50 : Math.max(0, parsedProtect);
       const config = {
+          transport: transport,
           tcpPort: tcpPort,
           udpPort: udpPort,
           discardOutOfOrder: document.getElementById('discardOrder').checked,
@@ -422,6 +737,7 @@
           config.protectMs = rawProtect;
       }
       try {
+        await persistPreferencesNow();
         await window.api.startUdpServer(config);
       } catch (err) {
         showWarning(t('errorPrefix') + err.message);
@@ -430,6 +746,398 @@
 
     function stopUdp() {
       window.api.stopUdpServer();
+    }
+
+    async function startQuic() {
+      const quicPort = parseInt(document.getElementById('quicPort').value, 10);
+      const udpFallbackPort = parseInt(document.getElementById('quicFallbackPort').value, 10);
+      const httpOutputPort = parseInt(document.getElementById('quicHttpPort').value, 10);
+      const maxLatencyMs = parseInt(document.getElementById('quicMaxLatency').value, 10);
+      if (isNaN(quicPort) || quicPort < 1 || quicPort > 65535) {
+        showValidationWarning('quicPortInvalid');
+        return;
+      }
+      if (isNaN(udpFallbackPort) || udpFallbackPort < 1 || udpFallbackPort > 65535) {
+        showValidationWarning('quicFallbackPortInvalid');
+        return;
+      }
+      if (quicPort === udpFallbackPort) {
+        showValidationWarning('quicPortsConflict');
+        return;
+      }
+      if (isNaN(httpOutputPort) || httpOutputPort < 1 || httpOutputPort > 65535) {
+        showValidationWarning('httpOutputPortInvalid');
+        return;
+      }
+      if (isNaN(maxLatencyMs) || maxLatencyMs < 20 || maxLatencyMs > 2000) {
+        showValidationWarning('latencyBudgetInvalid');
+        return;
+      }
+      clearWarning();
+      try {
+        await persistPreferencesNow();
+        await window.api.startQuicServer({
+          quicPort,
+          udpFallbackPort,
+          httpOutputPort,
+          maxLatencyMs,
+          synchronizePullStreams: document.getElementById('quicSynchronizePullStreams').checked,
+          includeAudioInPull: document.getElementById('quicIncludeAudioInPull').checked
+        });
+      } catch (err) {
+        showWarning(t('errorPrefix') + err.message);
+      }
+    }
+
+    async function stopQuic() {
+      try {
+        await window.api.stopQuicServer();
+      } catch (err) {
+        showWarning(t('errorPrefix') + err.message);
+      }
+    }
+
+    function applyQuicMediaResult(result) {
+      const index = lastQuicSessions.findIndex((session) => session.sessionId === result.sessionId);
+      if (index < 0) return;
+      const updated = {
+        ...lastQuicSessions[index],
+        active: result.active === true,
+        recordingEnabled: result.recordingEnabled === true,
+        replayBuffering: result.replayBuffering === true,
+        replayDurationMs: result.replayDurationMs,
+        recordingPath: result.recordingPath || lastQuicSessions[index].recordingPath
+      };
+      if (Number.isFinite(result.replayDurationMs)) {
+        quicReplayDurationBySession.set(result.sessionId, Math.round(result.replayDurationMs / 1000));
+      }
+      lastQuicSessions = updated.active || updated.replayBuffering
+        ? lastQuicSessions.map((session, itemIndex) => itemIndex === index ? updated : session)
+        : lastQuicSessions.filter((session) => session.sessionId !== result.sessionId);
+      renderQuicConnections(lastQuicSessions);
+    }
+
+    async function runQuicMediaOperation(sessionId, operation) {
+      if (pendingQuicMediaSessions.has(sessionId)) return null;
+      pendingQuicMediaSessions.add(sessionId);
+      renderQuicConnections(lastQuicSessions);
+      clearWarning();
+      try {
+        const result = await operation();
+        applyQuicMediaResult(result);
+        return result;
+      } catch (err) {
+        showWarning(t('errorPrefix') + err.message);
+        return null;
+      } finally {
+        pendingQuicMediaSessions.delete(sessionId);
+        renderQuicConnections(lastQuicSessions);
+      }
+    }
+
+    async function toggleQuicRecording(sessionId) {
+      const session = lastQuicSessions.find((candidate) => candidate.sessionId === sessionId);
+      if (!session || session.active === false) return;
+      await runQuicMediaOperation(sessionId, () => session.recordingEnabled
+        ? window.api.stopQuicRecording(sessionId)
+        : window.api.startQuicRecording(sessionId));
+    }
+
+    async function toggleQuicReplayBuffer(sessionId, durationSeconds) {
+      const session = lastQuicSessions.find((candidate) => candidate.sessionId === sessionId);
+      if (!session) return;
+      if (session.replayBuffering) {
+        await runQuicMediaOperation(sessionId, () => window.api.stopQuicReplayBuffer(sessionId));
+        return;
+      }
+      if (session.active === false) return;
+      const duration = Number(durationSeconds);
+      if (!Number.isInteger(duration) || duration < 5 || duration > 300) {
+        showValidationWarning('replayBufferDurationInvalid');
+        return;
+      }
+      quicReplayDurationBySession.set(sessionId, duration);
+      await runQuicMediaOperation(
+        sessionId,
+        () => window.api.startQuicReplayBuffer(sessionId, duration)
+      );
+    }
+
+    async function saveQuicReplayBuffer(sessionId) {
+      const result = await runQuicMediaOperation(
+        sessionId,
+        () => window.api.saveQuicReplayBuffer(sessionId)
+      );
+      if (result?.paths?.length) {
+        await window.api.openQuicFolder();
+      }
+    }
+
+    function renderQuicConnections(sessions) {
+      lastQuicSessions = sessions || [];
+      const currentSessionIds = new Set(lastQuicSessions.map((session) => session.sessionId));
+      for (const sessionId of quicReplayDurationBySession.keys()) {
+        if (!currentSessionIds.has(sessionId)) quicReplayDurationBySession.delete(sessionId);
+      }
+      const container = document.getElementById('quicSessionList');
+      container.replaceChildren();
+      if (lastQuicSessions.length === 0) {
+        container.className = 'no-streams';
+        container.textContent = t('noPublishers');
+        return;
+      }
+      container.className = '';
+      for (const session of lastQuicSessions) {
+        const active = session.active !== false;
+        const metrics = session.metrics || {};
+        const item = document.createElement('div');
+        item.className = 'stream-item';
+        item.dataset.sessionId = session.sessionId;
+        item.classList.toggle('stream-ended', !active);
+        const header = document.createElement('div');
+        header.className = 'stream-header';
+        const pathEl = document.createElement('span');
+        pathEl.className = 'stream-path';
+        pathEl.textContent = session.streamPath;
+        const transportEl = document.createElement('span');
+        transportEl.className = 'transport-tag';
+        transportEl.textContent = String(session.transport || 'quic').toUpperCase();
+        const sourceEl = document.createElement('span');
+        sourceEl.className = 'stream-viewers-count';
+        sourceEl.textContent = session.ip + ' · ' + (session.width || '?') + 'x' + (session.height || '?');
+        const stateEl = document.createElement('span');
+        stateEl.className = active ? 'stream-state live' : 'stream-state ended';
+        stateEl.textContent = t(active ? 'streamLive' : 'streamEnded');
+        header.append(pathEl, transportEl, sourceEl, stateEl);
+
+        const mediaControls = createQuicMediaControls(session);
+        const endedNotice = document.createElement('div');
+        endedNotice.className = 'ended-replay-note';
+        endedNotice.textContent = t('endedReplayAvailable');
+        endedNotice.classList.toggle('is-hidden', active || !session.replayBuffering);
+
+        const grid = document.createElement('div');
+        grid.className = 'metric-grid';
+        if (active) {
+          const playbackUrl = buildHttpPlaybackUrl(session.httpPlaybackPath);
+          appendCopyableMetric(grid, t('playbackUrl'), playbackUrl);
+        }
+        appendMetric(grid, t('latencyRange'), formatRange(metrics.latencyMinMs, metrics.latencyMaxMs));
+        if (Number.isFinite(metrics.finalLatencyMs)) {
+          appendMetric(grid, t('finalLatency'), formatMs(metrics.finalLatencyMs));
+        }
+        appendMetric(grid, t('encodeAverage'), formatMs(metrics.encodeAverageMs));
+        appendMetric(grid, t('encodeP95'), formatMs(metrics.encodeP95Ms));
+        appendMetric(grid, t('clockRtt'), formatMs(metrics.clockRttMs));
+        appendMetric(grid, t('streamRate'), formatRate(metrics));
+        appendMetric(grid, t('packetLoss'), formatPercent(metrics.packetLossRatio));
+        appendMetric(grid, t('recovered'), String(metrics.recoveredFragments || 0));
+        appendMetric(grid, t('dropped'), String(metrics.droppedFrames || 0));
+        if (session.recordingPath || metrics.recordingPath) {
+          appendMetric(grid, t('recordingFile'), session.recordingPath || metrics.recordingPath);
+        }
+        item.append(header, mediaControls, endedNotice, grid);
+        container.appendChild(item);
+      }
+    }
+
+    function createQuicMediaControls(session) {
+      const active = session.active !== false;
+      const pending = pendingQuicMediaSessions.has(session.sessionId);
+      const controls = document.createElement('div');
+      controls.className = 'stream-media-controls';
+
+      const recordButton = document.createElement('button');
+      recordButton.type = 'button';
+      recordButton.className = 'btn-sm btn-secondary btn-record';
+      recordButton.textContent = t(session.recordingEnabled ? 'stopRecording' : 'startRecording');
+      recordButton.disabled = pending || !active;
+      recordButton.setAttribute('aria-pressed', String(session.recordingEnabled === true));
+      recordButton.addEventListener('click', () => {
+        void toggleQuicRecording(session.sessionId);
+      });
+
+      const durationField = document.createElement('label');
+      durationField.className = 'session-replay-field';
+      const durationLabel = document.createElement('span');
+      durationLabel.textContent = t('sessionReplayDuration');
+      const durationInput = document.createElement('input');
+      durationInput.className = 'session-replay-duration';
+      durationInput.type = 'number';
+      durationInput.min = '5';
+      durationInput.max = '300';
+      durationInput.inputMode = 'numeric';
+      const activeDuration = Number.isFinite(session.replayDurationMs)
+        ? Math.round(session.replayDurationMs / 1000)
+        : null;
+      const defaultDuration = parseInt(document.getElementById('quicReplaySeconds').value, 10) || 30;
+      const rememberedDuration = quicReplayDurationBySession.has(session.sessionId)
+        ? quicReplayDurationBySession.get(session.sessionId)
+        : defaultDuration;
+      durationInput.value = String(activeDuration ?? rememberedDuration);
+      durationInput.disabled = pending || !active || session.replayBuffering === true;
+      durationInput.addEventListener('input', (event) => {
+        event.target.value = event.target.value.replace(/\D/g, '');
+        quicReplayDurationBySession.set(session.sessionId, event.target.value);
+      });
+      durationField.append(durationLabel, durationInput);
+
+      const replayButton = document.createElement('button');
+      replayButton.type = 'button';
+      replayButton.className = 'btn-sm btn-secondary btn-replay-toggle';
+      replayButton.textContent = t(session.replayBuffering ? 'stopReplayBuffer' : 'startReplayBuffer');
+      replayButton.disabled = pending || (!active && !session.replayBuffering);
+      replayButton.setAttribute('aria-pressed', String(session.replayBuffering === true));
+      replayButton.addEventListener('click', () => {
+        void toggleQuicReplayBuffer(session.sessionId, durationInput.value);
+      });
+
+      const saveButton = document.createElement('button');
+      saveButton.type = 'button';
+      saveButton.className = 'btn-sm btn-secondary btn-replay-save';
+      saveButton.textContent = t('saveReplay');
+      saveButton.disabled = pending || !session.replayBuffering;
+      saveButton.addEventListener('click', () => {
+        void saveQuicReplayBuffer(session.sessionId);
+      });
+
+      controls.append(recordButton, durationField, replayButton, saveButton);
+      return controls;
+    }
+
+    function buildHttpPlaybackUrl(playbackPath) {
+      const port = document.getElementById('quicHttpPort').value || '8080';
+      // 无后缀的地址由服务端直接返回内置浏览器播放器页面。
+      const pagePath = String(playbackPath || '').replace(/\.flv$/, '');
+      return 'http://localhost:' + port + pagePath;
+    }
+
+    function appendMetric(parent, label, value) {
+      const el = document.createElement('div');
+      const name = document.createElement('strong');
+      name.textContent = label + ': ';
+      el.append(name, document.createTextNode(value));
+      parent.appendChild(el);
+    }
+
+    function appendCopyableMetric(parent, label, value) {
+      const el = document.createElement('div');
+      el.className = 'copyable-metric';
+      const name = document.createElement('strong');
+      name.textContent = label + ':';
+      const valueRow = document.createElement('div');
+      valueRow.className = 'copyable-value-row';
+      const valueEl = document.createElement('span');
+      valueEl.className = 'copyable-value';
+      valueEl.textContent = value;
+      valueRow.append(valueEl, createCopyButton(value));
+      el.append(name, valueRow);
+      parent.appendChild(el);
+    }
+
+    function createCopyButton(value, idleLabelKey = 'copy') {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'btn-sm btn-copy';
+      button.textContent = t(idleLabelKey);
+      button.title = t('copyPullUrl');
+      button.setAttribute('aria-label', t('copyPullUrl'));
+      button.addEventListener('click', () => {
+        void copyTextWithFeedback(value, button, idleLabelKey);
+      });
+      return button;
+    }
+
+    async function copyTextWithFeedback(value, button, idleLabelKey) {
+      button.disabled = true;
+      try {
+        await writeClipboardText(value);
+        button.textContent = t('copied');
+        button.classList.add('copied');
+      } catch (error) {
+        console.error('Failed to copy URL:', error);
+        button.textContent = '!';
+        button.classList.add('copy-failed');
+        showWarning(t('copyFailed'));
+      }
+      setTimeout(() => {
+        if (!button.isConnected) return;
+        button.textContent = t(idleLabelKey);
+        button.classList.remove('copied', 'copy-failed');
+        button.disabled = false;
+      }, 1500);
+    }
+
+    async function writeClipboardText(value) {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        try {
+          await navigator.clipboard.writeText(value);
+          return;
+        } catch {
+          // Fall through to the selection-based copy path.
+        }
+      }
+
+      const textarea = document.createElement('textarea');
+      textarea.value = value;
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      const copied = document.execCommand('copy');
+      textarea.remove();
+      if (!copied) {
+        throw new Error('Clipboard copy was rejected');
+      }
+    }
+
+    function formatRange(minimum, maximum) {
+      return Number.isFinite(minimum) && Number.isFinite(maximum)
+        ? minimum.toFixed(1) + '–' + maximum.toFixed(1) + ' ms'
+        : '—';
+    }
+
+    function formatMs(value) {
+      return Number.isFinite(value) ? value.toFixed(1) + ' ms' : '—';
+    }
+
+    function formatPercent(value) {
+      return Number.isFinite(value) ? (value * 100).toFixed(2) + '%' : '—';
+    }
+
+    function formatRate(metrics) {
+      const fps = Number.isFinite(metrics.fps) ? metrics.fps.toFixed(1) : '—';
+      const bitrate = Number.isFinite(metrics.bitrateKbps) ? Math.round(metrics.bitrateKbps) : '—';
+      return fps + ' fps · ' + bitrate + ' kbps';
+    }
+
+    async function showQuicAddresses() {
+      const ips = await window.api.getlocalAddresses();
+      const quicPort = document.getElementById('quicPort').value || '1935';
+      const udpPort = document.getElementById('quicFallbackPort').value || '9444';
+      const overlay = document.createElement('div');
+      overlay.className = 'modal-overlay';
+      const box = document.createElement('div');
+      box.className = 'modal-box';
+      const title = document.createElement('h3');
+      title.textContent = t('pushAddressesTitle');
+      const list = document.createElement('ul');
+      for (const ip of ips) {
+        for (const address of ['quic://' + ip + ':' + quicPort + '/live/camera', 'udp://' + ip + ':' + udpPort + '/live/camera']) {
+          const li = document.createElement('li');
+          li.textContent = address;
+          list.appendChild(li);
+        }
+      }
+      const closeBtn = document.createElement('button');
+      closeBtn.className = 'btn-close';
+      closeBtn.textContent = 'OK';
+      closeBtn.addEventListener('click', () => overlay.remove());
+      box.append(title, list, closeBtn);
+      overlay.append(box);
+      document.body.append(overlay);
+      overlay.addEventListener('click', (event) => { if (event.target === overlay) overlay.remove(); });
     }
 
     const rtmpConnectionsE = document.getElementById('rtmpConnections');
@@ -445,15 +1153,16 @@
       clearWarning();
 
       try {
+        await persistPreferencesNow();
         await window.api.startRtmpServer(rtmpPort);
-        rtmpConnectionsE.style.display = 'block';
+        rtmpConnectionsE.classList.remove('is-hidden');
       } catch (err) {
         showWarning(t('errorPrefix') + err.message);
       }
     }
 
     function stopRtmp() {
-      window.api.stopRtmpServer().then(() => {rtmpConnectionsE.style.display = 'none'});
+      window.api.stopRtmpServer().then(() => { rtmpConnectionsE.classList.add('is-hidden'); });
     }
 
     // Track which streams have their viewer list expanded
@@ -522,7 +1231,7 @@
           viewerList.className = 'viewer-list';
 
           const label = document.createElement('div');
-          label.style.color = '#4fc3f7';
+          label.className = 'viewer-list-label';
           label.textContent = t('viewerAddresses');
           viewerList.appendChild(label);
 
@@ -542,14 +1251,7 @@
     function copyPullUrl(streamPath, btn) {
       const rtmpPort = document.getElementById('rtmpPort').value || '1935';
       const pullUrl = 'rtmp://localhost:' + rtmpPort + streamPath;
-      navigator.clipboard.writeText(pullUrl).then(() => {
-        btn.textContent = '\u2713';
-        btn.classList.add('copied');
-        setTimeout(() => {
-          btn.textContent = t('copyPullUrl');
-          btn.classList.remove('copied');
-        }, 1500);
-      });
+      void copyTextWithFeedback(pullUrl, btn, 'copyPullUrl');
     }
 
     async function showLocalAddresses() {
@@ -645,14 +1347,13 @@
       title.textContent = t('aboutTitle');
 
       const appInfo = document.createElement('p');
-      appInfo.style.margin = '8px 0 16px';
-      appInfo.style.color = '#aaa';
+      appInfo.className = 'app-info';
       appInfo.textContent = 'Livesuite v1.0.0';
 
       const viewLicensesBtn = document.createElement('button');
       viewLicensesBtn.className = 'btn-close';
       viewLicensesBtn.textContent = t('viewLicenses');
-      viewLicensesBtn.style.marginBottom = '16px';
+      viewLicensesBtn.classList.add('license-action');
       viewLicensesBtn.addEventListener('click', async () => {
         viewLicensesBtn.disabled = true;
         viewLicensesBtn.textContent = t('loading');

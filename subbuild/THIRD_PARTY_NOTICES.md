@@ -1,6 +1,20 @@
 # Third Party Notices
 
-This project fetches and statically links the following third-party component at build time.
+This project fetches or builds the following third-party components at build time.
+
+## Rust QUIC bridge
+
+The `livesuite_audio_quic.dll` runtime is built from the dependency versions locked in
+`quic-bridge/Cargo.lock`. Its principal components are:
+
+- Quinn 0.11.x — MIT OR Apache-2.0
+- rustls 0.23.x — Apache-2.0 OR ISC OR MIT
+- Tokio 1.x — MIT
+- rcgen 0.14.x — MIT OR Apache-2.0
+
+Their source distributions and license files are available from crates.io and their
+respective upstream repositories. Transitive Rust dependency versions are recorded in
+the committed Cargo lockfile.
 
 ## Opus
 

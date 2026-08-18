@@ -3,32 +3,64 @@ import { spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import {
+  LiveSuiteQuicMetrics,
+  LiveSuiteQuicServer,
+  LiveSuiteQuicSession,
+} from './quicServer';
+import {
   createStreamServer,
   DeclarativeStreamServer,
   RtmpProtocol,
   StreamServerDeclaration,
 } from '@livesuite/stream-server';
+import {
+  AppLanguage,
+  createDefaultPreferences,
+  UserPreferenceStore,
+} from './preferences';
 
 let mainWindow: BrowserWindow | null;
 let udpServer: ChildProcess | null = null;
 let rtmpServer: DeclarativeStreamServer | null = null;
+let quicServer: LiveSuiteQuicServer | null = null;
 let udpRunning = false;
 let rtmpRunning = false;
+let quicRunning = false;
 let isHighLatency = false;
-type AppLanguage = 'zh-CN' | 'en';
+let shuttingDown = false;
+let shutdownComplete = false;
+let shutdownPromise: Promise<void> | null = null;
 
 let appLanguage: AppLanguage = 'en';
+let preferenceStore: UserPreferenceStore | null = null;
 
 let wasapiStatus = {
   hasDll: false,
   hasConfig: false,
 };
 
+function sendToRenderer(channel: string, ...args: unknown[]) {
+  const window = mainWindow;
+  if (!window || window.isDestroyed() || window.webContents.isDestroyed()) {
+    return;
+  }
+  window.webContents.send(channel, ...args);
+}
+
 const mainMessages = {
   'zh-CN': {
     invalidTcpPort: '无效的 TCP 端口：必须是 1 到 65535 之间的数字',
-    invalidUdpPort: '无效的 UDP 端口：必须是 1 到 65535 之间的数字',
+    invalidUdpPort: '无效的音频端口：必须是 1 到 65535 之间的数字',
     invalidRtmpPort: '无效的 RTMP 端口：必须是 1 到 65535 之间的数字',
+    invalidQuicPort: '无效的 QUIC 端口：必须是 1 到 65535 之间的数字',
+    invalidQuicFallbackPort: '无效的 UDP 回退端口：必须是 1 到 65535 之间的数字',
+    invalidHttpOutputPort: '无效的 HTTP 输出端口：必须是 1 到 65535 之间的数字',
+    invalidReplayDuration: '回放缓存时长必须是 5 到 300 秒',
+    invalidQuicSession: '无效的视频流会话',
+    quicNotRunning: 'LiveSuite 低延迟服务器尚未运行',
+    quicPortsConflict: 'QUIC 与 UDP 回退端口不能相同',
+    quicErrorTitle: 'LiveSuite 低延迟服务器错误',
+    quicStartFailed: 'LiveSuite 低延迟服务器启动失败。请检查接收程序、端口占用和防火墙设置。',
     udpHighLatency: 'UDP 服务器：检测到高延迟！',
     udpLatencyNormal: 'UDP 服务器：延迟已恢复正常。',
     rtmpErrorTitle: 'RTMP 服务器错误',
@@ -36,8 +68,17 @@ const mainMessages = {
   },
   en: {
     invalidTcpPort: 'Invalid TCP Port: Must be a number between 1 and 65535',
-    invalidUdpPort: 'Invalid UDP Port: Must be a number between 1 and 65535',
+    invalidUdpPort: 'Invalid audio port: Must be a number between 1 and 65535',
     invalidRtmpPort: 'Invalid RTMP Port: Must be a number between 1 and 65535',
+    invalidQuicPort: 'Invalid QUIC Port: Must be a number between 1 and 65535',
+    invalidQuicFallbackPort: 'Invalid UDP fallback port: Must be a number between 1 and 65535',
+    invalidHttpOutputPort: 'Invalid HTTP output port: Must be a number between 1 and 65535',
+    invalidReplayDuration: 'Replay buffer duration must be between 5 and 300 seconds',
+    invalidQuicSession: 'Invalid video stream session',
+    quicNotRunning: 'The LiveSuite low-latency server is not running',
+    quicPortsConflict: 'QUIC and UDP fallback ports must be different',
+    quicErrorTitle: 'LiveSuite Low-Latency Server Error',
+    quicStartFailed: 'Failed to start the LiveSuite low-latency server. Check the receiver binary, port usage, and firewall settings.',
     udpHighLatency: 'UDP Server: High latency detected!',
     udpLatencyNormal: 'UDP Server: Latency normal.',
     rtmpErrorTitle: 'RTMP Server Error',
@@ -55,6 +96,17 @@ function mainT(key: MainMessageKey) {
   return mainMessages[appLanguage][key];
 }
 
+function getPreferenceStore(): UserPreferenceStore {
+  if (!preferenceStore) {
+    const defaults = createDefaultPreferences(normalizeAppLanguage(app.getLocale()));
+    preferenceStore = new UserPreferenceStore(
+      path.join(app.getPath('userData'), 'preferences.json'),
+      defaults,
+    );
+  }
+  return preferenceStore;
+}
+
 function checkWasapiStatus() {
   const buildDir = path.join(__dirname, '../../../subbuild');
   const dllPath = path.join(buildDir, 'wasapi_relink.dll');
@@ -64,17 +116,25 @@ function checkWasapiStatus() {
     hasDll: fs.existsSync(dllPath),
     hasConfig: fs.existsSync(configPath),
   };
-  mainWindow?.webContents.send('wasapi-status-changed', wasapiStatus);
+  sendToRenderer('wasapi-status-changed', wasapiStatus);
 }
 
 function updateStatus() {
-  mainWindow?.webContents.send('server-status-changed', { udpRunning, rtmpRunning });
+  sendToRenderer('server-status-changed', {
+    udpRunning,
+    rtmpRunning,
+    quicRunning,
+  });
 }
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 900,
-    height: 700,
+    width: 1180,
+    height: 820,
+    minWidth: 860,
+    minHeight: 640,
+    backgroundColor: '#141619',
+    title: 'LiveSuite',
     show: false,
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.js'),
@@ -95,6 +155,28 @@ function createWindow() {
     updateStatus();
     checkWasapiStatus();
   });
+  mainWindow.on('close', (event) => {
+    if (shutdownComplete) {
+      return;
+    }
+    if (shuttingDown) {
+      event.preventDefault();
+      return;
+    }
+    if (!hasRunningServices()) return;
+    event.preventDefault();
+    void shutdownServices().then(() => {
+      const window = mainWindow;
+      if (window && !window.isDestroyed()) {
+        window.close();
+      } else {
+        app.quit();
+      }
+    });
+  });
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+  });
 
   // Watch build directory for changes to wasapi_relink.dll
   const buildDir = path.join(__dirname, '../../../subbuild');
@@ -114,19 +196,33 @@ ipcMain.handle('open-wasapi-folder', () => {
 });
 ipcMain.handle('set-app-language', (_, language) => {
   appLanguage = normalizeAppLanguage(language);
+  const current = getPreferenceStore().get();
+  getPreferenceStore().replace({ ...current, language: appLanguage });
   return appLanguage;
 });
 
-ipcMain.handle('get-server-status', () => ({ udpRunning, rtmpRunning }));
+ipcMain.handle('get-user-preferences', () => getPreferenceStore().get());
+ipcMain.handle('set-user-preferences', (_, preferences) => {
+  const saved = getPreferenceStore().replace(preferences);
+  appLanguage = saved.language;
+  return saved;
+});
+
+ipcMain.handle('get-server-status', () => ({
+  udpRunning,
+  rtmpRunning,
+  quicRunning,
+}));
 
 // UDP Server Control
 ipcMain.handle('start-udp-server', (_, config) => {
   if (udpRunning) return;
 
+  const transport = config.transport === 'udp' ? 'udp' : 'quic';
   const tcpPort = parseInt(config.tcpPort, 10);
   const udpPort = parseInt(config.udpPort, 10);
 
-  if (isNaN(tcpPort) || tcpPort < 1 || tcpPort > 65535) {
+  if (transport === 'udp' && (isNaN(tcpPort) || tcpPort < 1 || tcpPort > 65535)) {
     throw new Error(mainT('invalidTcpPort'));
   }
   if (isNaN(udpPort) || udpPort < 1 || udpPort > 65535) {
@@ -135,10 +231,13 @@ ipcMain.handle('start-udp-server', (_, config) => {
 
   const serverPath = path.join(__dirname, '../../../subbuild/audio_server_udp.exe');
   const args = [
-    '--tcp', tcpPort.toString(),
+    '--transport', transport,
     '--udp', udpPort.toString()
   ];
-  if (config.discardOutOfOrder) args.push('--discard-out-of-order');
+  if (transport === 'udp') {
+    args.push('--tcp', tcpPort.toString());
+    if (config.discardOutOfOrder) args.push('--discard-out-of-order');
+  }
   const dropBaselineMs = typeof config.dropBaselineMs === 'number' && !isNaN(config.dropBaselineMs)
     ? Math.max(0, config.dropBaselineMs) : 0;
   const protectMs = typeof config.protectMs === 'number' && !isNaN(config.protectMs)
@@ -154,7 +253,10 @@ ipcMain.handle('start-udp-server', (_, config) => {
   udpServer.on('error', (err) => {
     udpRunning = false;
     updateStatus();
-    throw err;
+    if (!shuttingDown) {
+      console.error('[LiveSuite Audio]', err);
+      sendToRenderer('server-warning', err.message);
+    }
   });
 
   udpRunning = true;
@@ -169,10 +271,10 @@ ipcMain.handle('start-udp-server', (_, config) => {
 
       if (isCurrentlyHigh && !isHighLatency) {
         isHighLatency = true;
-        mainWindow?.webContents.send('server-warning', mainT('udpHighLatency'));
+        sendToRenderer('server-warning', mainT('udpHighLatency'));
       } else if (!isCurrentlyHigh && isHighLatency) {
         isHighLatency = false;
-        mainWindow?.webContents.send('server-clear', mainT('udpLatencyNormal'));
+        sendToRenderer('server-clear', mainT('udpLatencyNormal'));
       }
     }
   });
@@ -191,6 +293,205 @@ ipcMain.handle('stop-udp-server', () => {
   udpServer = null;
   udpRunning = false;
   updateStatus();
+});
+
+// LiveSuite private low-latency video server (QUIC + raw UDP fallback)
+let activeQuicSessions: Map<string, LiveSuiteQuicSession> = new Map();
+let activeQuicMetrics: Map<string, LiveSuiteQuicMetrics> = new Map();
+
+function getSubbuildDirectory(): string {
+  return app.isPackaged
+    ? path.join(process.resourcesPath, 'subbuild')
+    : path.join(app.getAppPath(), 'subbuild');
+}
+
+function broadcastQuicConnections() {
+  const sessions = [...activeQuicSessions.values()].map((session) => ({
+    ...session,
+    metrics: activeQuicMetrics.get(session.sessionId) ?? null,
+  }));
+  sendToRenderer('quic-connections-updated', sessions);
+}
+
+ipcMain.handle('start-quic-server', async(_, config) => {
+  if (quicRunning) return;
+
+  const quicPort = parseInt(config.quicPort, 10);
+  const udpFallbackPort = parseInt(config.udpFallbackPort, 10);
+  const httpOutputPort = parseInt(config.httpOutputPort, 10);
+  if (isNaN(quicPort) || quicPort < 1 || quicPort > 65535) {
+    throw new Error(mainT('invalidQuicPort'));
+  }
+  if (isNaN(udpFallbackPort) || udpFallbackPort < 1 || udpFallbackPort > 65535) {
+    throw new Error(mainT('invalidQuicFallbackPort'));
+  }
+  if (isNaN(httpOutputPort) || httpOutputPort < 1 || httpOutputPort > 65535) {
+    throw new Error(mainT('invalidHttpOutputPort'));
+  }
+  if (quicPort === udpFallbackPort) {
+    throw new Error(mainT('quicPortsConflict'));
+  }
+
+  const parsedMaxLatency = Number(config.maxLatencyMs);
+  const maxLatencyMs = Number.isFinite(parsedMaxLatency)
+    ? Math.min(2000, Math.max(20, Math.round(parsedMaxLatency)))
+    : 150;
+  const recordingDir = path.join(app.getPath('videos'), 'LiveSuite', 'Recordings');
+  // Rust 侧编译为 napi `.node` addon,由主进程内嵌加载(替代原 exe 子进程)。
+  const addonPath = app.isPackaged
+    ? path.join(process.resourcesPath, 'subbuild', 'livesuite-quic-server.node')
+    : path.join(app.getAppPath(), 'native-bin', 'livesuite-quic-server.node');
+  const browserPlayerHtmlPath = app.isPackaged
+    ? path.join(process.resourcesPath, 'subbuild', 'browser_player.html')
+    : path.join(app.getAppPath(), 'native', 'livesuite-quic', 'src', 'browser_player.html');
+  activeQuicSessions = new Map();
+  activeQuicMetrics = new Map();
+
+  const server = new LiveSuiteQuicServer({
+    addonPath,
+    browserPlayerHtmlPath,
+    port: quicPort,
+    udpFallbackPort,
+    httpOutputPort,
+    recordingDir,
+    maxLatencyMs,
+    synchronizePullStreams: config.synchronizePullStreams === true,
+    includeAudioInPull: config.includeAudioInPull === true,
+  });
+  quicServer = server;
+  server.on('published', (session) => {
+    activeQuicSessions.set(session.sessionId, session);
+    broadcastQuicConnections();
+  });
+  server.on('publish-ended', (session) => {
+    if (session.replayBuffering) {
+      activeQuicSessions.set(session.sessionId, session);
+    } else {
+      activeQuicSessions.delete(session.sessionId);
+      activeQuicMetrics.delete(session.sessionId);
+    }
+    broadcastQuicConnections();
+  });
+  server.on('metrics', (metrics) => {
+    activeQuicMetrics.set(metrics.sessionId, metrics);
+    const session = activeQuicSessions.get(metrics.sessionId);
+    if (session) {
+      activeQuicSessions.set(metrics.sessionId, {
+        ...session,
+        active: metrics.active,
+        recordingEnabled: metrics.recordingEnabled,
+        replayBuffering: metrics.replayBuffering,
+        replayDurationMs: metrics.replayDurationMs,
+        recordingPath: metrics.recordingPath ?? session.recordingPath,
+      });
+    }
+    broadcastQuicConnections();
+  });
+  server.on('media-status', (status) => {
+    const session = activeQuicSessions.get(status.sessionId);
+    if (!session) return;
+    const updated = {
+      ...session,
+      active: status.active,
+      recordingEnabled: status.recordingEnabled,
+      replayBuffering: status.replayBuffering,
+      replayDurationMs: status.replayDurationMs,
+      recordingPath: status.recordingPath ?? session.recordingPath,
+    };
+    if (!updated.active && !updated.replayBuffering) {
+      activeQuicSessions.delete(status.sessionId);
+      activeQuicMetrics.delete(status.sessionId);
+    } else {
+      activeQuicSessions.set(status.sessionId, updated);
+    }
+    broadcastQuicConnections();
+  });
+  server.on('error', (error) => {
+    console.error('[LiveSuite Low Latency]', error);
+    if (!shuttingDown) {
+      sendToRenderer('server-warning', error.message);
+    }
+  });
+
+  try {
+    await server.start();
+    quicRunning = true;
+    updateStatus();
+  } catch (error) {
+    quicServer = null;
+    quicRunning = false;
+    updateStatus();
+    const reason = error instanceof Error ? error.message : String(error);
+    if (!shuttingDown) {
+      dialog.showErrorBox(
+        mainT('quicErrorTitle'),
+        `${mainT('quicStartFailed')}\n\n${reason}`,
+      );
+    }
+    throw error;
+  }
+});
+
+ipcMain.handle('stop-quic-server', async() => {
+  const server = quicServer;
+  quicServer = null;
+  quicRunning = false;
+  await server?.stop();
+  activeQuicSessions = new Map();
+  activeQuicMetrics = new Map();
+  broadcastQuicConnections();
+  updateStatus();
+});
+
+ipcMain.handle('set-quic-synchronize-pull-streams', async(_, enabled) => {
+  return requireQuicServer().setSynchronizePullStreams(enabled === true);
+});
+
+function requireQuicServer(): LiveSuiteQuicServer {
+  if (!quicRunning || !quicServer) {
+    throw new Error(mainT('quicNotRunning'));
+  }
+  return quicServer;
+}
+
+function requireQuicSessionId(value: unknown): string {
+  if (typeof value !== 'string' || !/^[0-9a-f]{16}$/i.test(value)) {
+    throw new Error(mainT('invalidQuicSession'));
+  }
+  return value.toLowerCase();
+}
+
+ipcMain.handle('start-quic-recording', async(_, sessionId) => {
+  return requireQuicServer().startRecording(requireQuicSessionId(sessionId));
+});
+
+ipcMain.handle('stop-quic-recording', async(_, sessionId) => {
+  return requireQuicServer().stopRecording(requireQuicSessionId(sessionId));
+});
+
+ipcMain.handle('start-quic-replay-buffer', async(_, sessionId, durationSeconds) => {
+  const seconds = Number(durationSeconds);
+  if (!Number.isFinite(seconds) || seconds < 5 || seconds > 300) {
+    throw new Error(mainT('invalidReplayDuration'));
+  }
+  return requireQuicServer().startReplayBuffer(
+    requireQuicSessionId(sessionId),
+    Math.round(seconds * 1000),
+  );
+});
+
+ipcMain.handle('save-quic-replay-buffer', async(_, sessionId) => {
+  return requireQuicServer().saveReplayBuffer(requireQuicSessionId(sessionId));
+});
+
+ipcMain.handle('stop-quic-replay-buffer', async(_, sessionId) => {
+  return requireQuicServer().stopReplayBuffer(requireQuicSessionId(sessionId));
+});
+
+ipcMain.handle('open-quic-folder', async() => {
+  const outputDir = path.join(app.getPath('videos'), 'LiveSuite', 'Recordings');
+  await fs.promises.mkdir(outputDir, { recursive: true });
+  return shell.openPath(outputDir);
 });
 
 // RTMP Server Control
@@ -217,7 +518,7 @@ function broadcastRtmpConnections() {
     }
     streams.push({ streamPath: pub.streamPath, publisherId: id, viewers });
   }
-  mainWindow?.webContents.send('rtmp-connections-updated', streams);
+  sendToRenderer('rtmp-connections-updated', streams);
 }
 
 function getViewerIp(session: any): string {
@@ -296,7 +597,9 @@ ipcMain.handle('start-rtmp-server', async(_, port) => {
     rtmpRunning = false;
     rtmpServer = null;
     updateStatus();
-    dialog.showErrorBox(mainT('rtmpErrorTitle'), mainT('rtmpStartFailed'));
+    if (!shuttingDown) {
+      dialog.showErrorBox(mainT('rtmpErrorTitle'), mainT('rtmpStartFailed'));
+    }
   });
 
   rtmpServer.on('published', (event) => {
@@ -339,5 +642,80 @@ ipcMain.handle('stop-rtmp-server', async() => {
   activeViewers = new Map();
 });
 
+function hasRunningServices() {
+  return Boolean(
+    udpRunning
+    || rtmpRunning
+    || quicRunning
+    || udpServer
+    || rtmpServer
+    || quicServer,
+  );
+}
+
+function stopChildProcess(child: ChildProcess | null): Promise<void> {
+  if (!child || child.exitCode !== null) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const timeout = setTimeout(resolve, 2000);
+    child.once('exit', () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+    child.once('error', () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+    child.kill();
+  });
+}
+
+function shutdownServices(): Promise<void> {
+  if (shutdownPromise) {
+    return shutdownPromise;
+  }
+  shuttingDown = true;
+  const audio = udpServer;
+  const stream = rtmpServer;
+  const quic = quicServer;
+  udpServer = null;
+  rtmpServer = null;
+  quicServer = null;
+  udpRunning = false;
+  rtmpRunning = false;
+  quicRunning = false;
+  isHighLatency = false;
+
+  shutdownPromise = Promise.allSettled([
+    stopChildProcess(audio),
+    stream?.stop() ?? Promise.resolve(),
+    quic?.stop() ?? Promise.resolve(),
+  ]).then(() => {
+    shutdownComplete = true;
+  });
+  return shutdownPromise;
+}
+
+app.on('before-quit', (event) => {
+  if (shutdownComplete) {
+    return;
+  }
+  if (shuttingDown) {
+    event.preventDefault();
+    return;
+  }
+  if (!hasRunningServices()) return;
+  event.preventDefault();
+  void shutdownServices().then(() => app.quit());
+});
+
+app.on('window-all-closed', () => {
+  app.quit();
+});
+
 Menu.setApplicationMenu(null);
-app.whenReady().then(createWindow);
+app.whenReady().then(() => {
+  appLanguage = getPreferenceStore().get().language;
+  createWindow();
+});

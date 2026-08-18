@@ -6,6 +6,18 @@
 
 它使用了重排序以提高音频稳定性，在拥有足够冗余缓冲数据时，会将乱序音频重组成正常顺序的音频。但是你也可以禁用这一条（开启丢弃乱序包选项），以获取轻微的延迟提升。
 
+## 低延迟视频输出
+
+LiveSuite 专属的 QUIC/UDP 视频接收端默认只提供可拉取的 HTTP-FLV，不在界面内解码画面，也不会把每次推流自动写成文件。地址格式为：
+
+```text
+http://<LiveSuite IP>:<HTTP 输出端口>/<推流路径>.flv
+```
+
+例如 `/phone/stream` 在默认端口上的本机地址是 `http://localhost:8080/phone/stream.flv`。该地址可用于 ffplay、VLC，或 OBS 的“媒体源”（关闭“本地文件”后填入 URL）。
+
+视频服务运行后，每条推流都可独立开始或结束 MP4 录制，不需要中断其他流。每条流也有独立的滚动回放缓存和缓存时长，可按需将最近一段画面保存成 MP4；断流后已形成的可解码缓存仍可单独保存或释放。两类文件都保存在系统“视频/LiveSuite/Recordings”目录。
+
 
 
 ### [wasapi_relink](https://github.com/Litttlefish/wasapi_relink)推荐配置（请保存为redirect_config.toml在subbuild文件夹中）
@@ -69,14 +81,14 @@ npm run licenses:text
 ### 打包发布
 
 ```bash
-# 完整构建和发布流程（会自动生成许可证文档）
+# 一条命令完成全部构建与打包
 npm run release
-
-# 或手动分步执行
-npm run build        # 编译 TypeScript
-npm run licenses     # 生成许可证文档
-npm run dist         # 打包安装程序
 ```
+
+该命令会依次构建原生音频服务器与音频 QUIC 桥、`stream-server`、视频 QUIC
+服务器和 Electron TypeScript，随后生成许可证文档并打包 NSIS 安装程序。任一步骤失败都会
+立即停止。生成的是带许可协议、安装范围选择、安装目录选择、快捷方式和卸载入口的完整安装
+向导，成功产物位于 `dist/LiveSuite Setup 1.0.0.exe`。
 
 ### 许可证文档说明
 
