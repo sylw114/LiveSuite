@@ -23,7 +23,9 @@
     // 播放的对齐延迟；网页定期拉取同步信息，把服务端时钟换算回本机时钟
     // 后统一调度所有流的播放时刻。
     const SYNC_URL = '/livesuite/sync-info';
+    const PLAYBACK_FEEDBACK_URL = '/livesuite/playback-feedback';
     const SYNC_POLL_MS = 1000;
+    const PLAYBACK_FEEDBACK_POLL_MS = 250;
     const TARGET_LATENCY_MS = 180;
     const MAX_VIDEO_INPUT = 300;
     const MAX_VIDEO_OUTPUT = 300;
@@ -37,6 +39,12 @@
     let syncInfoReady = false;
     const originByPath = new Map();
     const playerSessions = [];
+    const playbackClientId = (() => {
+      if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        return window.crypto.randomUUID();
+      }
+      return 'livesuite-' + Math.random().toString(36).slice(2) + '-' + Date.now().toString(36);
+    })();
     let syncSamples = [];
     const pageParams = new URLSearchParams(location.search);
     const parsedLatentMs = Number(pageParams.get('latent'));
@@ -47,6 +55,12 @@
 
     function playbackLatencyMs() {
       return Math.max(0, alignmentDelayMs) + EXTRA_LATENT_MS;
+    }
+
+    function applyPlaybackRate(rate) {
+      if (!Number.isFinite(rate)) return;
+      const bounded = Math.min(1.1, Math.max(0.9, rate));
+      for (const session of playerSessions) session.setPlaybackRate(bounded);
     }
 
     function refreshSyncInfo() {
@@ -61,6 +75,9 @@
           synchronizeEnabled = Boolean(info.synchronize);
           if (Number.isFinite(info.alignmentDelayMs) && info.alignmentDelayMs > 0) {
             alignmentDelayMs = info.alignmentDelayMs;
+          }
+          if (Number.isFinite(info.playbackRate)) {
+            applyPlaybackRate(info.playbackRate);
           }
           if (Array.isArray(info.streams)) {
             originByPath.clear();
@@ -186,6 +203,7 @@
         this.videoDecoder = null;
         this.videoInput = [];
         this.videoFrames = [];
+        this.networkBufferBytes = 0;
         this.waitingForKeyframe = true;
         this.decoderGeneration = 0;
         this.mediaBaseUs = null;
@@ -199,9 +217,12 @@
         this.audioConfigKey = '';
         this.audioDecoder = null;
         this.audioInput = [];
+        this.audioSources = new Set();
         this.audioBaseContextTime = null;
         this.audioScheduleCursor = 0;
         this.lastAudioPtsUs = null;
+        this.playbackRate = 1;
+        this.feedbackInFlight = false;
       }
 
       setFatal(message) {
@@ -227,6 +248,11 @@
         if (this.audioDecoder) {
           try { this.audioDecoder.close(); } catch (_) {}
         }
+        for (const entry of this.audioSources) {
+          entry.source.onended = null;
+          try { entry.source.stop(); } catch (_) {}
+        }
+        this.audioSources.clear();
         this.audioDecoder = null;
         this.audioInput = [];
         this.audioBaseContextTime = null;
@@ -238,6 +264,7 @@
         this.closeVideoDecoder();
         this.closeAudioDecoder();
         this.flvHeaderRead = false;
+        this.networkBufferBytes = 0;
         this.videoConfig = null;
         this.videoConfigKey = '';
         this.audioConfig = null;
@@ -248,6 +275,90 @@
         this.lastInputPtsUs = null;
         this.lastDisplayedPtsUs = null;
         if (this.context) this.context.clearRect(0, 0, this.canvas.width, this.canvas.height);
+      }
+
+      // 速率变化时保持当前媒体位置连续,只改变后续播放时间的斜率。
+      setPlaybackRate(rate) {
+        const next = Number.isFinite(rate) ? Math.min(1.1, Math.max(0.9, rate)) : 1;
+        if (Math.abs(next - this.playbackRate) < 0.001) return;
+        const now = performance.now();
+        if (this.mediaBaseUs !== null && this.startPerfMs !== null) {
+          const currentTarget = this.mediaBaseUs
+            + (now - this.startPerfMs) * this.playbackRate * 1000;
+          this.startPerfMs = now
+            - (currentTarget - this.mediaBaseUs) / (next * 1000);
+        }
+        this.updateAudioPlaybackRate(next);
+        this.playbackRate = next;
+      }
+
+      updateAudioPlaybackRate(next) {
+        if (!this.audioContext) return;
+        const now = this.audioContext.currentTime;
+        if (this.audioBaseContextTime !== null) {
+          const currentRelative = (now - this.audioBaseContextTime) * this.playbackRate;
+          this.audioBaseContextTime = now - currentRelative / next;
+        }
+        let latestEnd = now + 0.02;
+        for (const entry of this.audioSources) {
+          const oldRate = entry.rate;
+          const elapsed = Math.max(0, now - entry.startAt);
+          const consumed = Math.min(entry.duration, elapsed * oldRate);
+          try { entry.source.playbackRate.setValueAtTime(next, now); } catch (_) {}
+          entry.rate = next;
+          entry.endAt = entry.startAt > now
+            ? entry.startAt + entry.duration / next
+            : now + Math.max(0, entry.duration - consumed) / next;
+          latestEnd = Math.max(latestEnd, entry.endAt);
+        }
+        this.audioScheduleCursor = latestEnd;
+      }
+
+      pruneAudioSources() {
+        if (!this.audioContext) return;
+        const now = this.audioContext.currentTime;
+        for (const entry of this.audioSources) {
+          if (entry.endAt <= now) this.audioSources.delete(entry);
+        }
+      }
+
+      playbackMetrics() {
+        this.pruneAudioSources();
+        let videoBufferBytes = this.networkBufferBytes;
+        for (const item of this.videoInput) videoBufferBytes += item.data.byteLength;
+        const videoGapCount = this.videoInput.length + this.videoFrames.length
+          + (this.videoDecoder ? this.videoDecoder.decodeQueueSize : 0);
+        const audioFrameCount = this.audioInput.length
+          + (this.audioDecoder ? this.audioDecoder.decodeQueueSize : 0)
+          + this.audioSources.size;
+        return {
+          clientId: playbackClientId,
+          streamPath: this.streamPath,
+          videoBufferBytes,
+          videoGapCount,
+          audioFrameCount,
+          hasAudio: this.audioConfig !== null,
+        };
+      }
+
+      async sendPlaybackFeedback() {
+        if (!this.running || this.fatal || this.feedbackInFlight) return;
+        this.feedbackInFlight = true;
+        try {
+          const response = await fetch(PLAYBACK_FEEDBACK_URL, {
+            method: 'POST',
+            cache: 'no-store',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(this.playbackMetrics())
+          });
+          if (!response.ok) return;
+          const control = await response.json();
+          if (Number.isFinite(control.playbackRate)) applyPlaybackRate(control.playbackRate);
+        } catch (_) {
+          // 播放反馈是辅助控制通道,短暂失败不应中断媒体流。
+        } finally {
+          this.feedbackInFlight = false;
+        }
       }
 
       resetForRealignment() {
@@ -461,9 +572,10 @@
           const relativeSeconds = (timestampUs - this.mediaBaseUs) / 1000000;
           if (this.audioBaseContextTime === null) {
             const videoDelay = Math.max(0, ((this.startPerfMs || performance.now()) - performance.now()) / 1000);
-            this.audioBaseContextTime = this.audioContext.currentTime + Math.max(0.03, videoDelay) - relativeSeconds;
+            this.audioBaseContextTime = this.audioContext.currentTime + Math.max(0.03, videoDelay)
+              - relativeSeconds / this.playbackRate;
           }
-          let startAt = this.audioBaseContextTime + relativeSeconds;
+          let startAt = this.audioBaseContextTime + relativeSeconds / this.playbackRate;
           const earliest = this.audioContext.currentTime + 0.02;
           if (startAt < earliest) {
             const shift = earliest - startAt;
@@ -474,10 +586,22 @@
           startAt = Math.max(startAt, this.audioScheduleCursor);
           const source = this.audioContext.createBufferSource();
           source.buffer = buffer;
+          source.playbackRate.value = this.playbackRate;
           source.connect(this.audioContext.destination);
-          source.onended = () => source.disconnect();
+          const entry = {
+            source,
+            startAt,
+            duration: buffer.duration,
+            rate: this.playbackRate,
+            endAt: startAt + buffer.duration / this.playbackRate
+          };
+          this.audioSources.add(entry);
+          source.onended = () => {
+            this.audioSources.delete(entry);
+            source.disconnect();
+          };
           source.start(startAt);
-          this.audioScheduleCursor = startAt + buffer.duration;
+          this.audioScheduleCursor = entry.endAt;
         } catch (_) {
           // 音频是可选轨道，音频转换失败不影响视频画面。
         } finally {
@@ -531,15 +655,16 @@
 
       renderFrame(now) {
         if (this.mediaBaseUs !== null && this.startPerfMs !== null) {
-          // 初始快照 GOP 或网络抖动可能堆积较多帧，检测到积压时动态追帧，防止持续延迟或溢出
-          if (EXTRA_LATENT_MS === 0 && this.videoFrames.length > 8) {
-            const catchupUs = (this.videoFrames.length - 3) * 8000;
-            this.startPerfMs -= catchupUs / 1000;
-          }
-          let targetPtsUs = this.mediaBaseUs + (now - this.startPerfMs) * 1000;
+          // 由服务端根据所有播放端水位下发速率,不再因解码队列稍有积压就
+          // 无条件追帧,给浏览器保留完成解码的时间。
+          let targetPtsUs = this.mediaBaseUs
+            + (now - this.startPerfMs) * this.playbackRate * 1000;
           if (this.lastInputPtsUs !== null && targetPtsUs > this.lastInputPtsUs + 500000) {
-            this.startPerfMs = now - (this.lastInputPtsUs - this.mediaBaseUs) / 1000 + playbackLatencyMs();
-            targetPtsUs = this.mediaBaseUs + (now - this.startPerfMs) * 1000;
+            this.startPerfMs = now
+              - (this.lastInputPtsUs - this.mediaBaseUs) / (this.playbackRate * 1000)
+              + playbackLatencyMs() / this.playbackRate;
+            targetPtsUs = this.mediaBaseUs
+              + (now - this.startPerfMs) * this.playbackRate * 1000;
           }
           let selected = null;
           while (this.videoFrames.length && Number(this.videoFrames[0].timestamp) <= targetPtsUs) {
@@ -607,10 +732,12 @@
             const result = await reader.read();
             if (result.done) break;
             if (result.value) buffer = appendBytes(buffer, result.value);
+            this.networkBufferBytes = buffer.byteLength;
             while (buffer.length) {
               const tag = this.readFlvTag(buffer);
               if (!tag) break;
               buffer = buffer.slice(tag.consumed);
+              this.networkBufferBytes = buffer.byteLength;
               this.handleTag(tag);
             }
           }
@@ -684,6 +811,9 @@
     const session = new StreamSession(ownPath, ownUrl, makeCanvas());
     sessions.push(session);
     session.runConnections();
+    setInterval(() => {
+      for (const activeSession of sessions) activeSession.sendPlaybackFeedback();
+    }, PLAYBACK_FEEDBACK_POLL_MS);
 
     function render(now) {
       for (const session of sessions) session.renderFrame(now);

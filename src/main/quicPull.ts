@@ -19,6 +19,74 @@ export const RAW_AUDIO = 6;
 /** 单连接待发队列上限,超过即断开(慢客户端断开重连,不影响其他连接)。 */
 const MAX_QUEUED_FRAMES = 512;
 const FLV_TIMESTAMP_MODULUS_MS = 0x1_0000_0000;
+const PLAYBACK_FEEDBACK_PATH = '/livesuite/playback-feedback';
+const PLAYBACK_FEEDBACK_TTL_MS = 2_500;
+
+/** 播放端水位阈值:字节和视频 gap 满足任一项即可认为有足够余量。 */
+export const MIN_VIDEO_BUFFER_BYTES = 1 * 1024 * 1024;
+export const MIN_VIDEO_GAP_COUNT = 1;
+export const HIGH_VIDEO_BUFFER_BYTES = 10 * 1024 * 1024;
+export const HIGH_VIDEO_GAP_COUNT = 5;
+export const MIN_AUDIO_FRAME_COUNT = 3;
+export const HIGH_AUDIO_FRAME_COUNT = 20;
+
+/** 速度调整保持温和,避免在阈值附近反复跳变造成新的抖动。 */
+export const SLOW_PLAYBACK_RATE = 0.95;
+export const NORMAL_PLAYBACK_RATE = 1;
+export const FAST_PLAYBACK_RATE = 1.05;
+
+export interface PlaybackFeedback {
+  clientId: string;
+  sessionId: string;
+  streamPath: string;
+  videoBufferBytes: number;
+  videoGapCount: number;
+  audioFrameCount: number;
+  hasAudio: boolean;
+  updatedAtMs: number;
+}
+
+export type PlaybackControlReason = 'underflow' | 'overbuffered' | 'steady';
+
+export interface PlaybackControl {
+  playbackRate: number;
+  reason: PlaybackControlReason;
+}
+
+/**
+ * 根据所有活跃播放端的最新水位决定统一播放速率。
+ * 视频的字节数/gap 数是“或”关系,音频存在时必须同时满足音频帧阈值。
+ */
+export function evaluatePlaybackControl(
+  feedback: readonly PlaybackFeedback[],
+): PlaybackControl {
+  if (feedback.length === 0) {
+    return { playbackRate: NORMAL_PLAYBACK_RATE, reason: 'steady' };
+  }
+
+  const hasUnderflow = feedback.some((entry) => {
+    const hasVideoReserve = entry.videoBufferBytes >= MIN_VIDEO_BUFFER_BYTES
+      || entry.videoGapCount >= MIN_VIDEO_GAP_COUNT;
+    const hasAudioReserve = !entry.hasAudio
+      || entry.audioFrameCount >= MIN_AUDIO_FRAME_COUNT;
+    return !hasVideoReserve || !hasAudioReserve;
+  });
+  if (hasUnderflow) {
+    return { playbackRate: SLOW_PLAYBACK_RATE, reason: 'underflow' };
+  }
+
+  const allOverbuffered = feedback.every((entry) => {
+    const hasHighVideoReserve = entry.videoBufferBytes > HIGH_VIDEO_BUFFER_BYTES
+      || entry.videoGapCount > HIGH_VIDEO_GAP_COUNT;
+    const hasHighAudioReserve = !entry.hasAudio
+      || entry.audioFrameCount > HIGH_AUDIO_FRAME_COUNT;
+    return hasHighVideoReserve && hasHighAudioReserve;
+  });
+  if (allOverbuffered) {
+    return { playbackRate: FAST_PLAYBACK_RATE, reason: 'overbuffered' };
+  }
+  return { playbackRate: NORMAL_PLAYBACK_RATE, reason: 'steady' };
+}
 
 export interface PullFrame {
   ordinal: number;
@@ -326,6 +394,11 @@ export class QuicPullHub {
   private browserPlayerHtml: string | null = null;
   private includeAudio = false;
   private synchronizedPullStreams: boolean | null = null;
+  private readonly playbackFeedback = new Map<string, PlaybackFeedback>();
+  private playbackControl: PlaybackControl = {
+    playbackRate: NORMAL_PLAYBACK_RATE,
+    reason: 'steady',
+  };
 
   constructor(source: QuicFrameSource, options: QuicPullHubOptions) {
     this.source = source;
@@ -382,6 +455,11 @@ export class QuicPullHub {
       session.connections.clear();
     }
     this.sessions.clear();
+    this.playbackFeedback.clear();
+    this.playbackControl = {
+      playbackRate: NORMAL_PLAYBACK_RATE,
+      reason: 'steady',
+    };
     const server = this.server;
     this.server = null;
     if (server) {
@@ -464,6 +542,12 @@ export class QuicPullHub {
 
   private endSession(session: PullSession): void {
     session.closed = true;
+    for (const [key, feedback] of this.playbackFeedback) {
+      if (feedback.sessionId === session.sessionId) {
+        this.playbackFeedback.delete(key);
+      }
+    }
+    this.refreshPlaybackControl();
     const endFrame: OutputFrame = {
       ordinal: Number.MAX_SAFE_INTEGER,
       kind: RAW_END,
@@ -475,6 +559,65 @@ export class QuicPullHub {
     for (const connection of session.connections) {
       connection.push(endFrame);
     }
+  }
+
+  /** 取出仍对应活跃 HTTP-FLV 连接的最新播放端反馈,并清理过期项。 */
+  private freshPlaybackFeedback(): PlaybackFeedback[] {
+    const now = epochMs();
+    for (const [key, feedback] of this.playbackFeedback) {
+      const session = this.sessions.get(feedback.sessionId);
+      if (now - feedback.updatedAtMs > PLAYBACK_FEEDBACK_TTL_MS
+        || !session || session.closed || session.connections.size === 0) {
+        this.playbackFeedback.delete(key);
+      }
+    }
+    return [...this.playbackFeedback.values()];
+  }
+
+  private refreshPlaybackControl(): PlaybackControl {
+    this.playbackControl = evaluatePlaybackControl(this.freshPlaybackFeedback());
+    return this.playbackControl;
+  }
+
+  private feedbackKey(clientId: string, sessionId: string): string {
+    return `${clientId}\u0000${sessionId}`;
+  }
+
+  /** 记录一个浏览器播放端的水位并返回当前全局播放控制。 */
+  private acceptPlaybackFeedback(value: unknown): PlaybackControl | null {
+    if (typeof value !== 'object' || value == null) {
+      return null;
+    }
+    const body = value as Record<string, unknown>;
+    const clientId = typeof body.clientId === 'string' ? body.clientId : '';
+    const streamPath = typeof body.streamPath === 'string' ? body.streamPath : '';
+    if (clientId.length === 0 || clientId.length > 128
+      || streamPath.length === 0 || streamPath.length > 2048) {
+      return null;
+    }
+    const session = this.findByPath(streamPath);
+    if (!session || session.closed || session.connections.size === 0) {
+      return null;
+    }
+    const metric = (name: string, integer: boolean): number => {
+      const raw = body[name];
+      if (typeof raw !== 'number' || !Number.isFinite(raw)) {
+        return 0;
+      }
+      const value = Math.max(0, Math.min(256 * 1024 * 1024, raw));
+      return integer ? Math.floor(value) : value;
+    };
+    this.playbackFeedback.set(this.feedbackKey(clientId, session.sessionId), {
+      clientId,
+      sessionId: session.sessionId,
+      streamPath,
+      videoBufferBytes: metric('videoBufferBytes', false),
+      videoGapCount: metric('videoGapCount', true),
+      audioFrameCount: metric('audioFrameCount', true),
+      hasAudio: body.hasAudio === true,
+      updatedAtMs: epochMs(),
+    });
+    return this.refreshPlaybackControl();
   }
 
   /** 轮询 addon 取新帧并分发给会话下的所有连接。 */
@@ -529,7 +672,8 @@ export class QuicPullHub {
     if (method === 'OPTIONS') {
       res.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, OPTIONS',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type',
         'Access-Control-Allow-Private-Network': 'true',
         'Content-Length': 0,
         'Connection': 'close',
@@ -537,11 +681,43 @@ export class QuicPullHub {
       res.end();
       return;
     }
+    const rawPath = (req.url ?? '/').split('?')[0] ?? '/';
+    if (method === 'POST' && rawPath === PLAYBACK_FEEDBACK_PATH) {
+      let body: string;
+      try {
+        body = await readRequestBody(req, 16 * 1024);
+      } catch {
+        writeHttpError(res, 413, 'Playback feedback is too large');
+        return;
+      }
+      let value: unknown;
+      try {
+        value = JSON.parse(body) as unknown;
+      } catch {
+        writeHttpError(res, 400, 'Invalid playback feedback');
+        return;
+      }
+      const control = this.acceptPlaybackFeedback(value);
+      if (!control) {
+        writeHttpError(res, 400, 'Invalid or inactive playback feedback');
+        return;
+      }
+      const responseBody = JSON.stringify(control);
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Length': Buffer.byteLength(responseBody),
+        'Cache-Control': 'no-store',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Private-Network': 'true',
+        'Connection': 'close',
+      });
+      res.end(responseBody);
+      return;
+    }
     if (method !== 'GET') {
       writeHttpError(res, 405, 'Method Not Allowed');
       return;
     }
-    const rawPath = (req.url ?? '/').split('?')[0] ?? '/';
     if (rawPath === '/' || rawPath === '') {
       writeHttpError(res, 404, 'Stream path is required');
       return;
@@ -554,10 +730,13 @@ export class QuicPullHub {
         const serverReceiveEpochMs = epochMs();
         const info = JSON.parse(this.source.syncInfoJson()) as Record<string, unknown>;
         const serverSendEpochMs = epochMs();
+        const playbackControl = this.refreshPlaybackControl();
         body = JSON.stringify({
           ...info,
           serverReceiveEpochMs,
           serverSendEpochMs,
+          playbackRate: playbackControl.playbackRate,
+          playbackReason: playbackControl.reason,
           ...(Number.isFinite(clientSendPerfMs) ? { clientSendPerfMs } : {}),
         });
       } catch {
@@ -826,6 +1005,38 @@ function percentDecodePath(path: string): string | null {
   } catch {
     return null;
   }
+}
+
+function readRequestBody(req: http.IncomingMessage, maxBytes: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    let settled = false;
+    const finish = (error?: Error): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (error) {
+        reject(error);
+      } else {
+        resolve(Buffer.concat(chunks).toString('utf8'));
+      }
+    };
+    req.on('data', (chunk: Buffer | string) => {
+      const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      totalBytes += data.length;
+      if (totalBytes > maxBytes) {
+        req.resume();
+        finish(new Error('request body exceeds limit'));
+        return;
+      }
+      chunks.push(data);
+    });
+    req.once('end', () => finish());
+    req.once('error', (error) => finish(error));
+    req.once('aborted', () => finish(new Error('request aborted')));
+  });
 }
 
 function epochMs(): number {
