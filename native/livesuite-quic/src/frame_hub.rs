@@ -24,7 +24,9 @@ const MAX_RING_FRAMES: usize = 600;
 const MAX_RING_BYTES: usize = 32 * 1024 * 1024;
 const MAX_AUDIO_GROUP_DURATION_US: i64 = 2_000_000;
 const MIN_ALIGNMENT_DELAY_MS: u64 = 60;
-const MAX_ALIGNMENT_DELAY_MS: u64 = 2_000;
+// 新流接入或网络恢复时,最慢流可能需要数秒的额外缓冲;环形缓冲和
+// 浏览器端的调速闭环会负责让已经播放的流平滑追上这个新延迟。
+const MAX_ALIGNMENT_DELAY_MS: u64 = 10_000;
 
 #[derive(Clone, Debug)]
 pub struct OutputFrame {

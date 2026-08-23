@@ -47,25 +47,39 @@
     })();
     let syncSamples = [];
     const pageParams = new URLSearchParams(location.search);
+    const ownPath = decodeStreamPath(location.pathname);
     const parsedLatentMs = Number(pageParams.get('latent'));
     // latent 只影响网页端的显示调度,不参与服务端拉流或时钟预测。
     const EXTRA_LATENT_MS = Number.isFinite(parsedLatentMs)
       ? Math.min(60_000, Math.max(0, parsedLatentMs))
+      : 0;
+    const parsedAudioLatentMs = Number(pageParams.get('audiolatent'));
+    // audiolatent 只把浏览器端的音频调度向后移动,不改变视频时间轴或
+    // 服务端对齐决策,适合音游等需要自行拉开音视频延迟的场景。
+    const EXTRA_AUDIO_LATENT_MS = Number.isFinite(parsedAudioLatentMs)
+      ? Math.min(60_000, Math.max(0, parsedAudioLatentMs))
       : 0;
 
     function playbackLatencyMs() {
       return Math.max(0, alignmentDelayMs) + EXTRA_LATENT_MS;
     }
 
-    function applyPlaybackRate(rate) {
+    function applyPlaybackRate(rate, streamPath = null) {
       if (!Number.isFinite(rate)) return;
       const bounded = Math.min(1.1, Math.max(0.9, rate));
-      for (const session of playerSessions) session.setPlaybackRate(bounded);
+      for (const session of playerSessions) {
+        if (streamPath === null || session.streamPath === streamPath) {
+          session.setPlaybackRate(bounded);
+        }
+      }
     }
 
     function refreshSyncInfo() {
       const t0 = performance.now();
-      fetch(SYNC_URL + '?t0=' + encodeURIComponent(t0), { cache: 'no-store' })
+      const syncQuery = '?t0=' + encodeURIComponent(t0)
+        + '&clientId=' + encodeURIComponent(playbackClientId)
+        + '&streamPath=' + encodeURIComponent(ownPath);
+      fetch(SYNC_URL + syncQuery, { cache: 'no-store' })
         .then((response) => response.ok ? response.json() : null)
         .then((info) => {
           if (!info) return;
@@ -77,7 +91,7 @@
             alignmentDelayMs = info.alignmentDelayMs;
           }
           if (Number.isFinite(info.playbackRate)) {
-            applyPlaybackRate(info.playbackRate);
+            applyPlaybackRate(info.playbackRate, ownPath);
           }
           if (Array.isArray(info.streams)) {
             originByPath.clear();
@@ -331,6 +345,17 @@
         const audioFrameCount = this.audioInput.length
           + (this.audioDecoder ? this.audioDecoder.decodeQueueSize : 0)
           + this.audioSources.size;
+        const playbackClockMs = serverOffsetMs === null
+          ? null
+          : performance.now() + serverOffsetMs;
+        const originServerMs = originByPath.get(this.streamPath);
+        // lastDisplayedPtsUs 是实际画面位置;页面 latent 会让它故意落后,
+        // 所以回报前补回对应的媒体时间,避免服务端把用户意图当成设备漂移。
+        const playbackPositionUs = this.lastDisplayedPtsUs !== null
+          && Number.isFinite(originServerMs)
+          ? originServerMs * 1000 + this.lastDisplayedPtsUs
+            + EXTRA_LATENT_MS * this.playbackRate * 1000
+          : null;
         return {
           clientId: playbackClientId,
           streamPath: this.streamPath,
@@ -338,6 +363,8 @@
           videoGapCount,
           audioFrameCount,
           hasAudio: this.audioConfig !== null,
+          playbackPositionUs,
+          playbackClockMs,
         };
       }
 
@@ -353,7 +380,9 @@
           });
           if (!response.ok) return;
           const control = await response.json();
-          if (Number.isFinite(control.playbackRate)) applyPlaybackRate(control.playbackRate);
+          if (Number.isFinite(control.playbackRate)) {
+            applyPlaybackRate(control.playbackRate, this.streamPath);
+          }
         } catch (_) {
           // 播放反馈是辅助控制通道,短暂失败不应中断媒体流。
         } finally {
@@ -573,6 +602,7 @@
           if (this.audioBaseContextTime === null) {
             const videoDelay = Math.max(0, ((this.startPerfMs || performance.now()) - performance.now()) / 1000);
             this.audioBaseContextTime = this.audioContext.currentTime + Math.max(0.03, videoDelay)
+              + EXTRA_AUDIO_LATENT_MS / 1000
               - relativeSeconds / this.playbackRate;
           }
           let startAt = this.audioBaseContextTime + relativeSeconds / this.playbackRate;
@@ -796,7 +826,6 @@
     const sessions = playerSessions;
 
     // 当前页面路径即默认流（与旧版单流页面行为一致）。
-    const ownPath = decodeStreamPath(location.pathname);
     // 页面参数只属于播放器,不传给 FLV 服务端。
     const ownUrl = new URL(location.pathname + '.flv', location.href).href;
 

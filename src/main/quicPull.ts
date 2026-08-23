@@ -21,6 +21,12 @@ const MAX_QUEUED_FRAMES = 512;
 const FLV_TIMESTAMP_MODULUS_MS = 0x1_0000_0000;
 const PLAYBACK_FEEDBACK_PATH = '/livesuite/playback-feedback';
 const PLAYBACK_FEEDBACK_TTL_MS = 2_500;
+const DEFAULT_ALIGNMENT_DELAY_MS = 180;
+const MAX_REPORTED_POSITION_US = Number.MAX_SAFE_INTEGER;
+const MAX_REPORTED_CLOCK_MS = Number.MAX_SAFE_INTEGER;
+const POSITION_DRIFT_DEADBAND_MS = 45;
+const POSITION_DRIFT_CORRECTION_MS = 80;
+const POSITION_DRIFT_HARD_CORRECTION_MS = 300;
 
 /** 播放端水位阈值:字节和视频 gap 满足任一项即可认为有足够余量。 */
 export const MIN_VIDEO_BUFFER_BYTES = 1 * 1024 * 1024;
@@ -43,49 +49,166 @@ export interface PlaybackFeedback {
   videoGapCount: number;
   audioFrameCount: number;
   hasAudio: boolean;
+  /** 已补回浏览器页面额外 latent 的服务端时间轴播放位置。 */
+  playbackPositionUs: number | null;
+  /** 浏览器 performance 时钟映射到服务端墙钟后的值,与 latent 无关。 */
+  playbackClockMs: number | null;
   updatedAtMs: number;
 }
 
-export type PlaybackControlReason = 'underflow' | 'overbuffered' | 'steady';
+export type PlaybackControlReason =
+  | 'underflow'
+  | 'overbuffered'
+  | 'ahead'
+  | 'behind'
+  | 'steady';
 
 export interface PlaybackControl {
   playbackRate: number;
   reason: PlaybackControlReason;
+  targetPositionUs: number | null;
+  positionErrorMs: number | null;
 }
 
 /**
- * 根据所有活跃播放端的最新水位决定统一播放速率。
+ * 根据播放端最新水位和服务端时间轴位置决定播放速率。
  * 视频的字节数/gap 数是“或”关系,音频存在时必须同时满足音频帧阈值。
+ *
+ * 一个页面的 latent 只影响它实际看到的画面位置,浏览器回报时会把这段
+ * 意图延迟补回。因此服务端可以直接把回报位置和
+ * `服务端当前时间 - alignmentDelay` 比较,处理新流加入和长时间时钟漂移。
  */
 export function evaluatePlaybackControl(
   feedback: readonly PlaybackFeedback[],
+  alignmentDelayMs = DEFAULT_ALIGNMENT_DELAY_MS,
+  nowMs = epochMs(),
 ): PlaybackControl {
   if (feedback.length === 0) {
-    return { playbackRate: NORMAL_PLAYBACK_RATE, reason: 'steady' };
+    return steadyPlaybackControl();
   }
 
-  const hasUnderflow = feedback.some((entry) => {
-    const hasVideoReserve = entry.videoBufferBytes >= MIN_VIDEO_BUFFER_BYTES
-      || entry.videoGapCount >= MIN_VIDEO_GAP_COUNT;
-    const hasAudioReserve = !entry.hasAudio
-      || entry.audioFrameCount >= MIN_AUDIO_FRAME_COUNT;
-    return !hasVideoReserve || !hasAudioReserve;
-  });
-  if (hasUnderflow) {
-    return { playbackRate: SLOW_PLAYBACK_RATE, reason: 'underflow' };
+  const controls = feedback.map((entry) => evaluateSinglePlaybackControl(
+    entry,
+    alignmentDelayMs,
+    nowMs,
+  ));
+  const firstNonSteady = controls.find((control) => control.reason !== 'steady');
+  if (firstNonSteady) {
+    // 这个聚合结果只作为未携带 clientId 的兼容回退;正常页面会拿到
+    // 自己对应的控制,不会因为另一路流漂移而一起改变速度。
+    const slowest = controls
+      .filter((control) => control.playbackRate < NORMAL_PLAYBACK_RATE)
+      .sort((left, right) => left.playbackRate - right.playbackRate)[0];
+    if (slowest) {
+      return slowest;
+    }
+    const fastest = controls
+      .filter((control) => control.playbackRate > NORMAL_PLAYBACK_RATE)
+      .sort((left, right) => right.playbackRate - left.playbackRate)[0];
+    if (fastest) {
+      return fastest;
+    }
+    return firstNonSteady;
   }
 
-  const allOverbuffered = feedback.every((entry) => {
-    const hasHighVideoReserve = entry.videoBufferBytes > HIGH_VIDEO_BUFFER_BYTES
-      || entry.videoGapCount > HIGH_VIDEO_GAP_COUNT;
-    const hasHighAudioReserve = !entry.hasAudio
-      || entry.audioFrameCount > HIGH_AUDIO_FRAME_COUNT;
-    return hasHighVideoReserve && hasHighAudioReserve;
-  });
-  if (allOverbuffered) {
-    return { playbackRate: FAST_PLAYBACK_RATE, reason: 'overbuffered' };
+  return steadyPlaybackControl();
+}
+
+function evaluateSinglePlaybackControl(
+  feedback: PlaybackFeedback,
+  alignmentDelayMs: number,
+  nowMs: number,
+): PlaybackControl {
+  const target = targetPlaybackPosition(feedback, alignmentDelayMs, nowMs);
+  const hasVideoReserve = feedback.videoBufferBytes >= MIN_VIDEO_BUFFER_BYTES
+    || feedback.videoGapCount >= MIN_VIDEO_GAP_COUNT;
+  const hasAudioReserve = !feedback.hasAudio
+    || feedback.audioFrameCount >= MIN_AUDIO_FRAME_COUNT;
+  if (!hasVideoReserve || !hasAudioReserve) {
+    return {
+      playbackRate: SLOW_PLAYBACK_RATE,
+      reason: 'underflow',
+      ...target,
+    };
   }
-  return { playbackRate: NORMAL_PLAYBACK_RATE, reason: 'steady' };
+
+  if (target.positionErrorMs !== null) {
+    if (target.positionErrorMs >= POSITION_DRIFT_HARD_CORRECTION_MS) {
+      return {
+        playbackRate: 0.9,
+        reason: 'ahead',
+        ...target,
+      };
+    }
+    if (target.positionErrorMs >= POSITION_DRIFT_CORRECTION_MS) {
+      return {
+        playbackRate: SLOW_PLAYBACK_RATE,
+        reason: 'ahead',
+        ...target,
+      };
+    }
+    if (target.positionErrorMs <= -POSITION_DRIFT_HARD_CORRECTION_MS) {
+      return {
+        playbackRate: 1.1,
+        reason: 'behind',
+        ...target,
+      };
+    }
+    if (target.positionErrorMs <= -POSITION_DRIFT_CORRECTION_MS) {
+      return {
+        playbackRate: FAST_PLAYBACK_RATE,
+        reason: 'behind',
+        ...target,
+      };
+    }
+  }
+
+  const hasHighVideoReserve = feedback.videoBufferBytes > HIGH_VIDEO_BUFFER_BYTES
+    || feedback.videoGapCount > HIGH_VIDEO_GAP_COUNT;
+  const hasHighAudioReserve = !feedback.hasAudio
+    || feedback.audioFrameCount > HIGH_AUDIO_FRAME_COUNT;
+  if (hasHighVideoReserve && hasHighAudioReserve
+    && (target.positionErrorMs === null
+      || target.positionErrorMs <= -POSITION_DRIFT_DEADBAND_MS)) {
+    return {
+      playbackRate: FAST_PLAYBACK_RATE,
+      reason: 'overbuffered',
+      ...target,
+    };
+  }
+  return {
+    playbackRate: NORMAL_PLAYBACK_RATE,
+    reason: 'steady',
+    ...target,
+  };
+}
+
+function targetPlaybackPosition(
+  feedback: PlaybackFeedback,
+  alignmentDelayMs: number,
+  nowMs: number,
+): Pick<PlaybackControl, 'targetPositionUs' | 'positionErrorMs'> {
+  if (feedback.playbackPositionUs === null) {
+    return { targetPositionUs: null, positionErrorMs: null };
+  }
+  const playbackClockMs = feedback.playbackClockMs !== null
+    && Math.abs(feedback.playbackClockMs - nowMs) <= 5_000
+    ? feedback.playbackClockMs
+    : nowMs;
+  const targetPositionUs = (playbackClockMs - Math.max(0, alignmentDelayMs)) * 1000;
+  return {
+    targetPositionUs,
+    positionErrorMs: (feedback.playbackPositionUs - targetPositionUs) / 1000,
+  };
+}
+
+function steadyPlaybackControl(): PlaybackControl {
+  return {
+    playbackRate: NORMAL_PLAYBACK_RATE,
+    reason: 'steady',
+    targetPositionUs: null,
+    positionErrorMs: null,
+  };
 }
 
 export interface PullFrame {
@@ -309,10 +432,11 @@ class PullConnection {
       const now = epochMs();
       let nextRelease: number | null = null;
       for (const frame of this.pending) {
-        if (frame.releaseEpochMs != null && frame.releaseEpochMs > now) {
+        const releaseEpochMs = this.releaseEpochMs(frame);
+        if (releaseEpochMs != null && releaseEpochMs > now) {
           nextRelease = nextRelease == null
-            ? frame.releaseEpochMs
-            : Math.min(nextRelease, frame.releaseEpochMs);
+            ? releaseEpochMs
+            : Math.min(nextRelease, releaseEpochMs);
         }
       }
       const waitMs = nextRelease != null
@@ -331,7 +455,7 @@ class PullConnection {
         continue;
       }
       this.watermark.observe(frame);
-      if (frame.releaseEpochMs != null) {
+      if (this.releaseEpochMs(frame) != null) {
         this.pending.push(frame);
       } else {
         const tag = flvTag(frame, this.timeline, stereo);
@@ -360,7 +484,13 @@ class PullConnection {
     safeMediaPts: number | null,
   ): Promise<void> {
     const { stream } = this;
-    const ready = takeReadyFrames(this.pending, epochMs(), forceAll, safeMediaPts);
+    const ready = takeReadyFrames(
+      this.pending,
+      epochMs(),
+      forceAll,
+      safeMediaPts,
+      (frame) => this.releaseEpochMs(frame),
+    );
     for (const frame of ready) {
       const tag = flvTag(frame, this.timeline, stereo);
       if (tag) {
@@ -368,6 +498,17 @@ class PullConnection {
       }
     }
     await Promise.resolve();
+  }
+
+  /** 同步模式下按当前对齐延迟重算,覆盖缓存帧生成时的旧 release。 */
+  private releaseEpochMs(frame: OutputFrame): number | null {
+    if (!this.session.synchronized || frame.timelineUs == null) {
+      return frame.releaseEpochMs;
+    }
+    const now = epochMs();
+    const maxHold = Math.max(500, this.session.alignmentDelayMs * 2);
+    const release = frame.timelineUs / 1000 + this.session.alignmentDelayMs;
+    return Math.min(now + maxHold, Math.max(now - maxHold, release));
   }
 }
 
@@ -379,6 +520,8 @@ interface PullSession {
   audioGroupDurationUs: number;
   includeAudio: boolean;
   originServerMs: number | null;
+  synchronized: boolean;
+  alignmentDelayMs: number;
   closed: boolean;
   connections: Set<PullConnection>;
   lastPolledOrdinal: number;
@@ -394,10 +537,13 @@ export class QuicPullHub {
   private browserPlayerHtml: string | null = null;
   private includeAudio = false;
   private synchronizedPullStreams: boolean | null = null;
+  private alignmentDelayMs = DEFAULT_ALIGNMENT_DELAY_MS;
   private readonly playbackFeedback = new Map<string, PlaybackFeedback>();
   private playbackControl: PlaybackControl = {
     playbackRate: NORMAL_PLAYBACK_RATE,
     reason: 'steady',
+    targetPositionUs: null,
+    positionErrorMs: null,
   };
 
   constructor(source: QuicFrameSource, options: QuicPullHubOptions) {
@@ -459,6 +605,8 @@ export class QuicPullHub {
     this.playbackControl = {
       playbackRate: NORMAL_PLAYBACK_RATE,
       reason: 'steady',
+      targetPositionUs: null,
+      positionErrorMs: null,
     };
     const server = this.server;
     this.server = null;
@@ -486,6 +634,8 @@ export class QuicPullHub {
       ...info,
       includeAudio: this.includeAudio,
       originServerMs: null,
+      synchronized: this.synchronizedPullStreams === true,
+      alignmentDelayMs: this.alignmentDelayMs,
       closed: false,
       connections: new Set(),
       lastPolledOrdinal: 0,
@@ -513,12 +663,16 @@ export class QuicPullHub {
   refreshOriginServerMs(): void {
     let syncInfo: {
       synchronize?: boolean;
+      alignmentDelayMs?: number;
       streams?: Array<{ path: string; originServerMs: number }>;
     } = {};
     try {
       syncInfo = JSON.parse(this.source.syncInfoJson()) as typeof syncInfo;
     } catch {
       return;
+    }
+    if (Number.isFinite(syncInfo.alignmentDelayMs) && syncInfo.alignmentDelayMs! > 0) {
+      this.alignmentDelayMs = Math.min(60_000, Math.max(0, syncInfo.alignmentDelayMs!));
     }
     const synchronized = syncInfo.synchronize === true;
     if (this.synchronizedPullStreams !== null && this.synchronizedPullStreams !== synchronized) {
@@ -531,6 +685,10 @@ export class QuicPullHub {
       }
     }
     this.synchronizedPullStreams = synchronized;
+    for (const session of this.sessions.values()) {
+      session.synchronized = synchronized;
+      session.alignmentDelayMs = this.alignmentDelayMs;
+    }
     for (const entry of syncInfo.streams ?? []) {
       for (const session of this.sessions.values()) {
         if (session.streamPath === entry.path) {
@@ -575,15 +733,42 @@ export class QuicPullHub {
   }
 
   private refreshPlaybackControl(): PlaybackControl {
-    this.playbackControl = evaluatePlaybackControl(this.freshPlaybackFeedback());
+    this.playbackControl = evaluatePlaybackControl(
+      this.freshPlaybackFeedback(),
+      this.alignmentDelayMs,
+    );
     return this.playbackControl;
+  }
+
+  /** 根据 client/session 查询控制;每一路流单独纠正设备时钟或新流对齐误差。 */
+  private playbackControlFor(clientId: string, streamPath: string): PlaybackControl {
+    const session = this.findByPath(streamPath);
+    if (!session) {
+      return this.refreshPlaybackControl();
+    }
+    const key = this.feedbackKey(clientId, session.sessionId);
+    const feedback = this.playbackFeedback.get(key);
+    if (!feedback) {
+      return {
+        playbackRate: NORMAL_PLAYBACK_RATE,
+        reason: 'steady',
+        targetPositionUs: null,
+        positionErrorMs: null,
+      };
+    }
+    const control = evaluatePlaybackControl(
+      [feedback],
+      this.alignmentDelayMs,
+      epochMs(),
+    );
+    return control;
   }
 
   private feedbackKey(clientId: string, sessionId: string): string {
     return `${clientId}\u0000${sessionId}`;
   }
 
-  /** 记录一个浏览器播放端的水位并返回当前全局播放控制。 */
+  /** 记录一个浏览器播放端的水位/时间轴位置并返回该路播放控制。 */
   private acceptPlaybackFeedback(value: unknown): PlaybackControl | null {
     if (typeof value !== 'object' || value == null) {
       return null;
@@ -607,7 +792,18 @@ export class QuicPullHub {
       const value = Math.max(0, Math.min(256 * 1024 * 1024, raw));
       return integer ? Math.floor(value) : value;
     };
-    this.playbackFeedback.set(this.feedbackKey(clientId, session.sessionId), {
+    const nullableMetric = (name: string, maximum: number): number | null => {
+      const raw = body[name];
+      if (raw == null) {
+        return null;
+      }
+      if (typeof raw !== 'number' || !Number.isFinite(raw)) {
+        return null;
+      }
+      return Math.max(0, Math.min(maximum, raw));
+    };
+    const updatedAtMs = epochMs();
+    const feedback: PlaybackFeedback = {
       clientId,
       sessionId: session.sessionId,
       streamPath,
@@ -615,9 +811,23 @@ export class QuicPullHub {
       videoGapCount: metric('videoGapCount', true),
       audioFrameCount: metric('audioFrameCount', true),
       hasAudio: body.hasAudio === true,
-      updatedAtMs: epochMs(),
-    });
-    return this.refreshPlaybackControl();
+      playbackPositionUs: nullableMetric('playbackPositionUs', MAX_REPORTED_POSITION_US),
+      playbackClockMs: nullableMetric('playbackClockMs', MAX_REPORTED_CLOCK_MS),
+      updatedAtMs,
+    };
+    const key = this.feedbackKey(clientId, session.sessionId);
+    this.playbackFeedback.set(key, feedback);
+    const control = evaluatePlaybackControl(
+      [feedback],
+      this.alignmentDelayMs,
+      updatedAtMs,
+    );
+    this.playbackControl = evaluatePlaybackControl(
+      this.freshPlaybackFeedback(),
+      this.alignmentDelayMs,
+      updatedAtMs,
+    );
+    return control;
   }
 
   /** 轮询 addon 取新帧并分发给会话下的所有连接。 */
@@ -727,16 +937,25 @@ export class QuicPullHub {
       try {
         const syncUrl = new URL(req.url ?? '/', 'http://livesuite.local');
         const clientSendPerfMs = Number(syncUrl.searchParams.get('t0'));
+        const clientId = syncUrl.searchParams.get('clientId') ?? '';
+        const streamPath = syncUrl.searchParams.get('streamPath') ?? '';
         const serverReceiveEpochMs = epochMs();
         const info = JSON.parse(this.source.syncInfoJson()) as Record<string, unknown>;
         const serverSendEpochMs = epochMs();
-        const playbackControl = this.refreshPlaybackControl();
+        if (typeof info.alignmentDelayMs === 'number' && Number.isFinite(info.alignmentDelayMs)) {
+          this.alignmentDelayMs = Math.min(60_000, Math.max(0, info.alignmentDelayMs));
+        }
+        const playbackControl = clientId.length > 0 && streamPath.length > 0
+          ? this.playbackControlFor(clientId, streamPath)
+          : this.refreshPlaybackControl();
         body = JSON.stringify({
           ...info,
           serverReceiveEpochMs,
           serverSendEpochMs,
           playbackRate: playbackControl.playbackRate,
           playbackReason: playbackControl.reason,
+          targetPositionUs: playbackControl.targetPositionUs,
+          positionErrorMs: playbackControl.positionErrorMs,
           ...(Number.isFinite(clientSendPerfMs) ? { clientSendPerfMs } : {}),
         });
       } catch {
@@ -873,11 +1092,13 @@ function takeReadyFrames(
   now: number,
   forceAll: boolean,
   safeMediaPts: number | null,
+  releaseEpochMs: (frame: OutputFrame) => number | null,
 ): OutputFrame[] {
   const kept: OutputFrame[] = [];
   const ready: OutputFrame[] = [];
   for (const frame of pending) {
-    const released = frame.releaseEpochMs == null || frame.releaseEpochMs <= now;
+    const releasedAt = releaseEpochMs(frame);
+    const released = releasedAt == null || releasedAt <= now;
     const isMedia = frame.kind === RAW_KEYFRAME || frame.kind === RAW_DELTA
       || frame.kind === RAW_AUDIO;
     const mediaIsSafe = !isMedia
