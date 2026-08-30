@@ -9,10 +9,12 @@
     body { display: grid; place-items: center; }
     #grid { display: grid; width: 100vw; height: 100vh; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 4px; background: #000; }
     canvas { display: block; width: 100%; height: 100%; background: #000; }
+    #audio-unlock { position: fixed; right: 12px; bottom: 12px; z-index: 10; border: 0; border-radius: 999px; padding: 8px 14px; font: 14px sans-serif; color: #fff; background: rgba(24, 24, 24, .8); cursor: pointer; }
   </style>
 </head>
 <body>
   <div id="grid"></div>
+  <button id="audio-unlock" type="button" hidden>开启声音</button>
   <script>
   (() => {
     'use strict';
@@ -26,10 +28,31 @@
     const PLAYBACK_FEEDBACK_URL = '/livesuite/playback-feedback';
     const SYNC_POLL_MS = 1000;
     const PLAYBACK_FEEDBACK_POLL_MS = 250;
+    const SYNC_REQUEST_TIMEOUT_MS = 2500;
+    const PLAYBACK_FEEDBACK_TIMEOUT_MS = 1000;
     const TARGET_LATENCY_MS = 180;
-    const MAX_VIDEO_INPUT = 300;
-    const MAX_VIDEO_OUTPUT = 300;
+    const MAX_VIDEO_INPUT = 90;
+    const MAX_VIDEO_INPUT_BYTES = 1536 * 1024;
+    const MAX_VIDEO_AHEAD_US = 750000;
+    // 解码后的帧只保留一个短展示窗口。输出帧数过大时，浏览器会在
+    // 短暂停顿后集中消化旧画面，视觉上就会形成“卡半秒、顺半秒”的锯齿。
+    const MAX_VIDEO_OUTPUT = 64;
+    const MAX_VIDEO_OUTPUT_AHEAD_US = 250000;
+    const INITIAL_TARGET_VIDEO_FPS = 60;
+    const MIN_TARGET_VIDEO_FPS = 12;
+    const MAX_TARGET_VIDEO_FPS = 240;
+    const FRAME_RATE_SAMPLE_INTERVAL_MS = 1000;
+    const REQUIRED_PRESENTATION_RATIO = 0.95;
+    // 超出承载能力时每个采样周期只下调 10%。这样播放端始终展示最新的
+    // 已采样画面，不会通过一次性清掉半秒队列来“追帧”。
+    const FRAME_RATE_DECREASE_RATIO = 0.90;
+    const FRAME_RATE_INCREASE_RATIO = 1.03;
+    const STABLE_SAMPLES_BEFORE_INCREASE = 4;
     const MAX_AUDIO_INPUT = 300;
+    const MAX_AUDIO_SOURCES = 1024;
+    const MAX_AUDIO_LATE_SCHEDULE_SECONDS = 0.25;
+    const PIPELINE_RECYCLE_INTERVAL_MS = 2 * 60 * 60 * 1000;
+    const DEGRADED_RECYCLE_SAMPLES = 40;
 
     // 服务端时钟估算：offset = serverEpochMs - performance.now()。多次取样
     // 后取最小 RTT 的样本，降低网络抖动对时钟换算的影响。
@@ -37,6 +60,7 @@
     let alignmentDelayMs = TARGET_LATENCY_MS;
     let synchronizeEnabled = false;
     let syncInfoReady = false;
+    let syncRequestInFlight = false;
     const originByPath = new Map();
     const playerSessions = [];
     const playbackClientId = (() => {
@@ -74,13 +98,30 @@
       }
     }
 
+    // Keep every short polling request bounded. A hung response would otherwise
+    // occupy one of the browser's per-host connections forever; repeated polls
+    // can then queue for hours and retain their request/response closures.
+    async function fetchJsonWithTimeout(url, init, timeoutMs) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(url, { ...init, signal: controller.signal });
+        if (!response.ok) return null;
+        return await response.json();
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
     function refreshSyncInfo() {
       const t0 = performance.now();
       const syncQuery = '?t0=' + encodeURIComponent(t0)
         + '&clientId=' + encodeURIComponent(playbackClientId)
         + '&streamPath=' + encodeURIComponent(ownPath);
-      fetch(SYNC_URL + syncQuery, { cache: 'no-store' })
-        .then((response) => response.ok ? response.json() : null)
+      syncRequestInFlight = true;
+      fetchJsonWithTimeout(SYNC_URL + syncQuery, {
+        cache: 'no-store',
+      }, SYNC_REQUEST_TIMEOUT_MS)
         .then((info) => {
           if (!info) return;
           const t1 = performance.now();
@@ -123,7 +164,10 @@
             for (const session of playerSessions) session.resetForRealignment();
           }
         })
-        .catch(() => {});
+        .catch(() => {})
+        .finally(() => {
+          syncRequestInFlight = false;
+        });
     }
     refreshSyncInfo();
     setInterval(refreshSyncInfo, SYNC_POLL_MS);
@@ -216,6 +260,7 @@
         this.videoConfigKey = '';
         this.videoDecoder = null;
         this.videoInput = [];
+        this.videoInputBytes = 0;
         this.videoFrames = [];
         this.networkBufferBytes = 0;
         this.waitingForKeyframe = true;
@@ -226,6 +271,29 @@
         this.lastDisplayedPtsUs = null;
         this.renderedFrames = 0;
         this.droppedFrames = 0;
+        this.decodedVideoFrames = 0;
+        this.lastVideoOutputAt = performance.now();
+        // 自适应展示帧率只决定“哪些已解码画面送到 canvas”。H.264 预测帧
+        // 仍按完整顺序交给解码器，不能在编码输入侧任意抽掉，否则会破坏参考帧。
+        this.targetVideoFps = INITIAL_TARGET_VIDEO_FPS;
+        this.sourceVideoFps = 0;
+        this.sourceRateWindowStartPtsUs = null;
+        this.sourceRateWindowFrames = 0;
+        this.lastSourceRatePtsUs = null;
+        this.nextVideoOutputPtsUs = null;
+        this.sampledVideoFrames = 0;
+        this.frameRateWindowStartMs = performance.now();
+        this.frameRateWindowRafCount = 0;
+        this.frameRateWindowLongRafCount = 0;
+        this.lastRenderCallbackMs = null;
+        this.frameRateWindowRenderedFrames = 0;
+        this.frameRateStableSamples = 0;
+        this.frameRateProbeStarted = false;
+        this.lastMeasuredRafFps = 0;
+        this.lastMeasuredPresentationFps = 0;
+        this.lastPresentationRatio = 1;
+        this.lastLongRafRatio = 0;
+        this.lastFrameRateBacklogged = false;
         this.audioContext = null;
         this.audioConfig = null;
         this.audioConfigKey = '';
@@ -237,6 +305,11 @@
         this.lastAudioPtsUs = null;
         this.playbackRate = 1;
         this.feedbackInFlight = false;
+        this.recycling = false;
+        this.degradedSamples = 0;
+        this.recycleTimer = setInterval(() => {
+          this.recyclePipeline('periodic');
+        }, PIPELINE_RECYCLE_INTERVAL_MS);
       }
 
       setFatal(message) {
@@ -252,10 +325,13 @@
         }
         this.videoDecoder = null;
         this.videoInput = [];
+        this.videoInputBytes = 0;
+        this.nextVideoOutputPtsUs = null;
         for (const frame of this.videoFrames) {
           try { frame.close(); } catch (_) {}
         }
         this.videoFrames = [];
+        this.lastVideoOutputAt = performance.now();
       }
 
       closeAudioDecoder() {
@@ -265,6 +341,7 @@
         for (const entry of this.audioSources) {
           entry.source.onended = null;
           try { entry.source.stop(); } catch (_) {}
+          try { entry.source.disconnect(); } catch (_) {}
         }
         this.audioSources.clear();
         this.audioDecoder = null;
@@ -291,28 +368,70 @@
         if (this.context) this.context.clearRect(0, 0, this.canvas.width, this.canvas.height);
       }
 
+      trimVideoInput() {
+        if (this.videoInput.length <= MAX_VIDEO_INPUT
+          && this.videoInputBytes <= MAX_VIDEO_INPUT_BYTES) {
+          return;
+        }
+
+        let lastKey = -1;
+        for (let index = this.videoInput.length - 1; index >= 0; index--) {
+          if (this.videoInput[index].key) {
+            lastKey = index;
+            break;
+          }
+        }
+
+        const keepFrom = lastKey > 0 ? lastKey : Math.max(0, this.videoInput.length - MAX_VIDEO_INPUT);
+        if (keepFrom <= 0) return;
+
+        this.videoInput = this.videoInput.slice(keepFrom);
+        this.videoInputBytes = this.videoInput.reduce(
+          (bytes, item) => bytes + item.data.byteLength,
+          0,
+        );
+        this.droppedFrames += keepFrom;
+      }
+
+      // A WebCodecs decoder can stop completing queued work after a bad
+      // transition. Rebuilding it is much cheaper than letting every new frame
+      // pile up in videoInput while decodeQueueSize remains pinned.
+      recoverStalledVideoDecoder() {
+        if (!this.videoDecoder || !this.videoInput.length) return;
+        if (this.videoDecoder.decodeQueueSize === 0) {
+          this.pumpVideo();
+          return;
+        }
+        if (performance.now() - this.lastVideoOutputAt < 1000) return;
+
+        setStatus('视频解码器停滞，正在重建…', true);
+        const videoConfig = this.videoConfig;
+        this.closeVideoDecoder();
+        if (videoConfig) this.configureVideo(videoConfig);
+      }
+
       // 速率变化时保持当前媒体位置连续,只改变后续播放时间的斜率。
       setPlaybackRate(rate) {
         const next = Number.isFinite(rate) ? Math.min(1.1, Math.max(0.9, rate)) : 1;
         if (Math.abs(next - this.playbackRate) < 0.001) return;
         const now = performance.now();
+        const currentTarget = this.currentTargetUs(now);
+        this.playbackRate = next;
         if (this.mediaBaseUs !== null && this.startPerfMs !== null) {
-          const currentTarget = this.mediaBaseUs
-            + (now - this.startPerfMs) * this.playbackRate * 1000;
           this.startPerfMs = now
             - (currentTarget - this.mediaBaseUs) / (next * 1000);
         }
+        if (this.audioContext && this.audioBaseContextTime !== null
+          && this.mediaBaseUs !== null) {
+          this.audioBaseContextTime = this.audioContext.currentTime
+            - (currentTarget - this.mediaBaseUs) / 1000000 / next;
+        }
         this.updateAudioPlaybackRate(next);
-        this.playbackRate = next;
       }
 
       updateAudioPlaybackRate(next) {
         if (!this.audioContext) return;
         const now = this.audioContext.currentTime;
-        if (this.audioBaseContextTime !== null) {
-          const currentRelative = (now - this.audioBaseContextTime) * this.playbackRate;
-          this.audioBaseContextTime = now - currentRelative / next;
-        }
         let latestEnd = now + 0.02;
         for (const entry of this.audioSources) {
           const oldRate = entry.rate;
@@ -332,8 +451,208 @@
         if (!this.audioContext) return;
         const now = this.audioContext.currentTime;
         for (const entry of this.audioSources) {
-          if (entry.endAt <= now) this.audioSources.delete(entry);
+          if (entry.endAt <= now) this.releaseAudioEntry(entry);
         }
+      }
+
+      releaseAudioEntry(entry) {
+        entry.source.onended = null;
+        try { entry.source.stop(); } catch (_) {}
+        try { entry.source.disconnect(); } catch (_) {}
+        this.audioSources.delete(entry);
+      }
+
+      // 视频时间轴始终使用 performance.now。AudioContext 仅用于安排声音，
+      // 不能反过来当视频主时钟：音频解码偶发迟到时若把整个主时钟向后推，
+      // 这个小误差会在长时间播放中不断累加，最终造成画面数秒停滞。
+      currentTargetUs(nowPerfMs = performance.now()) {
+        if (this.mediaBaseUs === null) return 0;
+        if (this.startPerfMs === null) return this.mediaBaseUs;
+        const elapsedPerfMs = Math.max(0, nowPerfMs - this.startPerfMs);
+        return this.mediaBaseUs + elapsedPerfMs * this.playbackRate * 1000;
+      }
+
+      observeSourceVideoRate(timestampUs) {
+        if (!Number.isFinite(timestampUs)) return;
+        if (this.lastSourceRatePtsUs === null
+          || timestampUs <= this.lastSourceRatePtsUs
+          || timestampUs - this.lastSourceRatePtsUs > 1000000) {
+          this.sourceRateWindowStartPtsUs = timestampUs;
+          this.sourceRateWindowFrames = 0;
+          this.lastSourceRatePtsUs = timestampUs;
+          return;
+        }
+        this.lastSourceRatePtsUs = timestampUs;
+        this.sourceRateWindowFrames++;
+        const windowStartUs = this.sourceRateWindowStartPtsUs;
+        if (windowStartUs === null) {
+          this.sourceRateWindowStartPtsUs = timestampUs;
+          this.sourceRateWindowFrames = 0;
+          return;
+        }
+        const elapsedUs = timestampUs - windowStartUs;
+        if (elapsedUs < 1000000) return;
+        const measuredFps = this.sourceRateWindowFrames * 1000000 / elapsedUs;
+        if (Number.isFinite(measuredFps) && measuredFps > 0) {
+          this.sourceVideoFps = this.sourceVideoFps > 0
+            ? this.sourceVideoFps * 0.7 + measuredFps * 0.3
+            : measuredFps;
+          // 起播后先以源帧率作为探测上限。若浏览器达不到 95% 的展示率，
+          // observeFrameRate 会每秒小步下调 targetVideoFps；若源本身低于
+          // 默认值，则由同一控制器平滑降到源帧率，避免切换时突兀跳变。
+          if (!this.frameRateProbeStarted) {
+            this.frameRateProbeStarted = true;
+            if (this.sourceVideoFps > this.targetVideoFps + 0.25) {
+              this.setTargetVideoFps(this.sourceVideoFps);
+            }
+          }
+        }
+        this.sourceRateWindowStartPtsUs = timestampUs;
+        this.sourceRateWindowFrames = 0;
+      }
+
+      setTargetVideoFps(value) {
+        const sourceFloor = this.sourceVideoFps > 0
+          ? Math.min(MIN_TARGET_VIDEO_FPS, this.sourceVideoFps)
+          : MIN_TARGET_VIDEO_FPS;
+        const bounded = Math.min(
+          MAX_TARGET_VIDEO_FPS,
+          Math.max(sourceFloor, Number.isFinite(value) ? value : INITIAL_TARGET_VIDEO_FPS),
+        );
+        const next = Math.round(bounded * 10) / 10;
+        if (Math.abs(next - this.targetVideoFps) < 0.25) return;
+        this.targetVideoFps = next;
+        // 新的抽帧间隔从下一张解码图像重新对齐，避免旧相位导致一段时间内
+        // 连续跳过或连续保留多张帧。
+        this.nextVideoOutputPtsUs = null;
+        this.trimVideoOutput();
+      }
+
+      videoOutputIntervalUs() {
+        return 1000000 / Math.max(1, this.targetVideoFps);
+      }
+
+      shouldQueueDecodedVideoFrame(timestampUs) {
+        if (!Number.isFinite(timestampUs)) return true;
+        const intervalUs = this.videoOutputIntervalUs();
+        if (this.nextVideoOutputPtsUs === null) {
+          this.nextVideoOutputPtsUs = timestampUs + intervalUs;
+          return true;
+        }
+        if (timestampUs < this.nextVideoOutputPtsUs) return false;
+        // 网络恢复后时间戳可能一次跨过多帧；直接从当前帧开始新的采样相位，
+        // 不让循环按数秒历史逐个补齐。
+        if (timestampUs - this.nextVideoOutputPtsUs > intervalUs * 4) {
+          this.nextVideoOutputPtsUs = timestampUs + intervalUs;
+          return true;
+        }
+        do {
+          this.nextVideoOutputPtsUs += intervalUs;
+        } while (this.nextVideoOutputPtsUs <= timestampUs);
+        return true;
+      }
+
+      trimVideoOutput() {
+        while (this.videoFrames.length > 1) {
+          const first = this.videoFrames[0];
+          const last = this.videoFrames[this.videoFrames.length - 1];
+          const outputAheadUs = Number(last.timestamp) - Number(first.timestamp);
+          if (this.videoFrames.length <= MAX_VIDEO_OUTPUT
+            && (!Number.isFinite(outputAheadUs) || outputAheadUs <= MAX_VIDEO_OUTPUT_AHEAD_US)) {
+            break;
+          }
+          const dropped = this.videoFrames.shift();
+          if (dropped) {
+            try { dropped.close(); } catch (_) {}
+          }
+          this.droppedFrames++;
+        }
+      }
+
+      queueDecodedVideoFrame(frame) {
+        const timestampUs = Number(frame.timestamp);
+        if (!this.shouldQueueDecodedVideoFrame(timestampUs)) {
+          this.sampledVideoFrames++;
+          frame.close();
+          return;
+        }
+        this.videoFrames.push(frame);
+        this.trimVideoOutput();
+      }
+
+      observeFrameRate(now) {
+        this.frameRateWindowRafCount++;
+        if (this.lastRenderCallbackMs !== null) {
+          const expectedIntervalMs = 1000 / Math.max(1, this.targetVideoFps);
+          if (now - this.lastRenderCallbackMs > expectedIntervalMs * 1.5) {
+            this.frameRateWindowLongRafCount++;
+          }
+        }
+        this.lastRenderCallbackMs = now;
+        const elapsedMs = now - this.frameRateWindowStartMs;
+        if (elapsedMs < FRAME_RATE_SAMPLE_INTERVAL_MS) return;
+
+        const elapsedSeconds = elapsedMs / 1000;
+        const rafFps = this.frameRateWindowRafCount / elapsedSeconds;
+        const renderedFrames = this.renderedFrames - this.frameRateWindowRenderedFrames;
+        const expectedFps = this.sourceVideoFps > 0
+          ? Math.min(this.targetVideoFps, this.sourceVideoFps)
+          : this.targetVideoFps;
+        const presentationRatio = expectedFps > 0
+          ? renderedFrames / (expectedFps * elapsedSeconds)
+          : 1;
+        const presentationFps = renderedFrames / elapsedSeconds;
+        const longRafRatio = this.frameRateWindowRafCount > 0
+          ? this.frameRateWindowLongRafCount / this.frameRateWindowRafCount
+          : 0;
+        this.lastMeasuredRafFps = rafFps;
+        this.lastMeasuredPresentationFps = presentationFps;
+        this.lastPresentationRatio = presentationRatio;
+        this.lastLongRafRatio = longRafRatio;
+
+        const hasRecentVideoOutput = now - this.lastVideoOutputAt < 1500;
+        if (this.sourceVideoFps > 0 && hasRecentVideoOutput
+          && Number.isFinite(rafFps) && rafFps > 0) {
+          const maximumFps = Math.min(
+            MAX_TARGET_VIDEO_FPS,
+            this.sourceVideoFps,
+            Math.max(1, rafFps * REQUIRED_PRESENTATION_RATIO),
+          );
+          const decoderBacklogged = this.videoInput.length > MAX_VIDEO_INPUT / 3
+            || this.videoInputBytes > MAX_VIDEO_INPUT_BYTES / 3
+            || (this.videoDecoder ? this.videoDecoder.decodeQueueSize >= 7 : false)
+            || this.videoFrames.length > Math.max(8, this.targetVideoFps * 0.35);
+          this.lastFrameRateBacklogged = decoderBacklogged;
+          const smooth = presentationRatio >= REQUIRED_PRESENTATION_RATIO
+            && longRafRatio <= 1 - REQUIRED_PRESENTATION_RATIO
+            && !decoderBacklogged;
+
+          if (this.targetVideoFps > maximumFps + 0.25 || !smooth) {
+            const step = Math.max(2, this.targetVideoFps * (1 - FRAME_RATE_DECREASE_RATIO));
+            // 不直接把目标跳到 maximumFps：该值在 CPU 短抖动时会很低，
+            // 一步跳变会导致抽帧相位和画面节奏忽高忽低。只向它靠近一个
+            // 固定小步，下一秒再重新测量 95% 平滑度。
+            const lowered = this.targetVideoFps - step;
+            const nextTarget = this.targetVideoFps > maximumFps
+              ? Math.max(maximumFps, lowered)
+              : lowered;
+            this.setTargetVideoFps(nextTarget);
+            this.frameRateStableSamples = 0;
+          } else {
+            this.frameRateStableSamples++;
+            if (this.frameRateStableSamples >= STABLE_SAMPLES_BEFORE_INCREASE
+              && this.targetVideoFps + 0.25 < maximumFps) {
+              const step = Math.max(1, this.targetVideoFps * (FRAME_RATE_INCREASE_RATIO - 1));
+              this.setTargetVideoFps(Math.min(maximumFps, this.targetVideoFps + step));
+              this.frameRateStableSamples = 0;
+            }
+          }
+        }
+
+        this.frameRateWindowStartMs = now;
+        this.frameRateWindowRafCount = 0;
+        this.frameRateWindowLongRafCount = 0;
+        this.frameRateWindowRenderedFrames = this.renderedFrames;
       }
 
       playbackMetrics() {
@@ -372,14 +691,25 @@
         if (!this.running || this.fatal || this.feedbackInFlight) return;
         this.feedbackInFlight = true;
         try {
-          const response = await fetch(PLAYBACK_FEEDBACK_URL, {
+          this.recoverStalledVideoDecoder();
+          const frameBacklog = this.videoFrames.length
+            + (this.videoDecoder ? this.videoDecoder.decodeQueueSize : 0);
+          const degraded = frameBacklog > 120
+            || this.audioSources.size > 300
+            || this.videoInput.length > MAX_VIDEO_INPUT
+            || this.videoInputBytes > MAX_VIDEO_INPUT_BYTES;
+          this.degradedSamples = degraded ? this.degradedSamples + 1 : 0;
+          if (this.degradedSamples >= DEGRADED_RECYCLE_SAMPLES) {
+            this.recyclePipeline('degraded');
+            return;
+          }
+          const control = await fetchJsonWithTimeout(PLAYBACK_FEEDBACK_URL, {
             method: 'POST',
             cache: 'no-store',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(this.playbackMetrics())
-          });
-          if (!response.ok) return;
-          const control = await response.json();
+          }, PLAYBACK_FEEDBACK_TIMEOUT_MS);
+          if (!control) return;
           if (Number.isFinite(control.playbackRate)) {
             applyPlaybackRate(control.playbackRate, this.streamPath);
           }
@@ -388,6 +718,18 @@
         } finally {
           this.feedbackInFlight = false;
         }
+      }
+
+      recyclePipeline(reason) {
+        if (this.recycling || !this.running || this.fatal) return;
+        this.recycling = true;
+        this.degradedSamples = 0;
+        setStatus('播放器运行时间过长，正在重建解码管线…', true);
+        this.abortController?.abort();
+        this.resetPipeline();
+        // Keep a running AudioContext across recycling. Recreating it outside
+        // the original user gesture can leave the replacement suspended.
+        void reason;
       }
 
       resetForRealignment() {
@@ -444,14 +786,9 @@
                 frame.close();
                 return;
               }
-              this.videoFrames.push(frame);
-              while (this.videoFrames.length > MAX_VIDEO_OUTPUT) {
-                const dropped = this.videoFrames.shift();
-                if (dropped) {
-                  try { dropped.close(); } catch (_) {}
-                }
-                this.droppedFrames++;
-              }
+              this.decodedVideoFrames++;
+              this.lastVideoOutputAt = performance.now();
+              this.queueDecodedVideoFrame(frame);
               this.pumpVideo();
             },
             error: () => {
@@ -475,6 +812,7 @@
         if (!this.videoDecoder || this.fatal) return;
         while (this.videoInput.length && this.videoDecoder.decodeQueueSize < 8) {
           const item = this.videoInput.shift();
+          this.videoInputBytes -= item.data.byteLength;
           try {
             this.videoDecoder.decode(new EncodedVideoChunk({
               type: item.key ? 'key' : 'delta',
@@ -491,12 +829,36 @@
 
       enqueueVideo(timestampUs, key, data) {
         if (this.fatal || !data.length) return;
+        this.observeSourceVideoRate(timestampUs);
         // 重连或网络追赶时,已经显示过的编码分片没有再送入解码器的价值。
         // 渲染队列还会继续丢弃已过播放时刻的解码帧,两层都限制旧数据堆积。
         if (this.lastDisplayedPtsUs !== null && timestampUs <= this.lastDisplayedPtsUs) {
           this.droppedFrames++;
           return;
         }
+
+        // Low-latency playback should not cache a future GOP. Once playback
+        // falls behind, keep only a keyframe boundary instead of decoding an
+        // ever-growing backlog and displaying seconds-old frames.
+        const targetUs = this.currentTargetUs();
+        const maxAheadUs = Math.max(MAX_VIDEO_AHEAD_US, playbackLatencyMs() * 2000);
+        if (targetUs !== null && timestampUs > targetUs + maxAheadUs) {
+          if (!key) {
+            this.droppedFrames++;
+            return;
+          }
+          this.videoInput = [];
+          this.videoInputBytes = 0;
+          this.closeVideoDecoder();
+          if (this.videoConfig) this.configureVideo(this.videoConfig);
+          this.mediaBaseUs = null;
+          this.startPerfMs = null;
+          if (!this.establishTimeline(timestampUs)) {
+            this.waitingForKeyframe = true;
+            return;
+          }
+        }
+
         if (this.lastInputPtsUs !== null && timestampUs + 1000000 < this.lastInputPtsUs) {
           if (!key) return;
           this.closeVideoDecoder();
@@ -514,15 +876,20 @@
         }
         if (!this.videoDecoder && this.videoConfig) this.configureVideo(this.videoConfig);
         if (!this.videoDecoder) return;
-        this.videoInput.push({ timestampUs, key, data: data.slice() });
-        if (this.videoInput.length > MAX_VIDEO_INPUT) {
-          const lastKey = this.videoInput.map((item) => item.key).lastIndexOf(true);
-          if (lastKey >= 0) {
-            this.videoInput = this.videoInput.slice(lastKey);
-          } else {
-            this.videoInput = this.videoInput.slice(-MAX_VIDEO_INPUT);
+        if (this.videoInput.length >= MAX_VIDEO_INPUT
+          || this.videoInputBytes + data.length > MAX_VIDEO_INPUT_BYTES) {
+          if (!key) {
+            this.droppedFrames++;
+            return;
           }
+          this.videoInput = [];
+          this.videoInputBytes = 0;
+          this.closeVideoDecoder();
+          if (this.videoConfig) this.configureVideo(this.videoConfig);
         }
+        this.videoInput.push({ timestampUs, key, data: data.slice() });
+        this.videoInputBytes += data.byteLength;
+        this.trimVideoInput();
         this.pumpVideo();
         setStatus('播放中');
       }
@@ -561,6 +928,8 @@
         } catch (_) {
           this.closeAudioDecoder();
           setStatus('音频解码不可用，视频仍可继续播放');
+        } finally {
+          refreshAudioUnlockVisibility();
         }
       }
 
@@ -582,6 +951,7 @@
       scheduleAudio(audioData) {
         if (!this.audioContext || this.audioContext.state !== 'running' || this.mediaBaseUs === null) {
           audioData.close();
+          refreshAudioUnlockVisibility();
           return;
         }
         try {
@@ -608,12 +978,55 @@
           let startAt = this.audioBaseContextTime + relativeSeconds / this.playbackRate;
           const earliest = this.audioContext.currentTime + 0.02;
           if (startAt < earliest) {
-            const shift = earliest - startAt;
-            this.audioBaseContextTime += shift;
-            this.startPerfMs = (this.startPerfMs || performance.now()) + shift * 1000;
-            startAt += shift;
+            const lateSeconds = earliest - startAt;
+            if (lateSeconds > MAX_AUDIO_LATE_SCHEDULE_SECONDS) {
+              // 音频解码落后太多时只丢弃过期声音；绝不能为了补音频把
+              // 视频主时钟整体后移，否则每次短暂卡顿都会积成长期掉帧。
+              const currentTargetUs = this.currentTargetUs();
+              const currentRelativeSeconds = (currentTargetUs - this.mediaBaseUs) / 1000000;
+              this.audioBaseContextTime = this.audioContext.currentTime
+                - currentRelativeSeconds / this.playbackRate;
+              return;
+            }
+            // 小幅晚到直接贴着安全边界播放，保持媒体主时钟不变。
+            startAt = earliest;
           }
           startAt = Math.max(startAt, this.audioScheduleCursor);
+          // A/V clock drift or a stalled display loop can leave a growing set
+          // of AudioBufferSourceNodes scheduled minutes or hours in the future.
+          // Detect that backlog and remap audio to the current display target;
+          // an audible jump is preferable to an increasingly sluggish page.
+          const nowAudio = this.audioContext.currentTime;
+          const scheduleAheadSeconds = Math.max(
+            2,
+            playbackLatencyMs() / 1000 + EXTRA_AUDIO_LATENT_MS / 1000 + 2,
+          );
+          if (startAt > nowAudio + scheduleAheadSeconds
+            || this.audioSources.size > MAX_AUDIO_SOURCES) {
+            setStatus('音频调度积压，正在重新对齐…', true);
+            const currentTargetUs = this.currentTargetUs();
+            const currentRelativeSeconds = (currentTargetUs - this.mediaBaseUs) / 1000000;
+            for (const entry of [...this.audioSources]) {
+              if (entry.startAt > nowAudio + 0.05) {
+                this.releaseAudioEntry(entry);
+              }
+            }
+            this.audioBaseContextTime = nowAudio
+              - currentRelativeSeconds / this.playbackRate;
+            this.audioScheduleCursor = nowAudio + 0.02;
+            startAt = this.audioBaseContextTime
+              + relativeSeconds / this.playbackRate;
+            if (startAt < earliest) {
+              if (earliest - startAt > MAX_AUDIO_LATE_SCHEDULE_SECONDS) {
+                return;
+              }
+              startAt = earliest;
+            }
+            startAt = Math.max(startAt, this.audioScheduleCursor);
+            if (startAt > nowAudio + scheduleAheadSeconds) {
+              return;
+            }
+          }
           const source = this.audioContext.createBufferSource();
           source.buffer = buffer;
           source.playbackRate.value = this.playbackRate;
@@ -684,17 +1097,30 @@
       }
 
       renderFrame(now) {
+        this.observeFrameRate(now);
         if (this.mediaBaseUs !== null && this.startPerfMs !== null) {
           // 由服务端根据所有播放端水位下发速率,不再因解码队列稍有积压就
           // 无条件追帧,给浏览器保留完成解码的时间。
-          let targetPtsUs = this.mediaBaseUs
-            + (now - this.startPerfMs) * this.playbackRate * 1000;
+          let targetPtsUs = this.currentTargetUs(now);
           if (this.lastInputPtsUs !== null && targetPtsUs > this.lastInputPtsUs + 500000) {
+            const correctedTargetUs = this.lastInputPtsUs
+              + playbackLatencyMs() * 1000;
             this.startPerfMs = now
               - (this.lastInputPtsUs - this.mediaBaseUs) / (this.playbackRate * 1000)
               + playbackLatencyMs() / this.playbackRate;
-            targetPtsUs = this.mediaBaseUs
-              + (now - this.startPerfMs) * this.playbackRate * 1000;
+            if (this.audioContext && this.audioBaseContextTime !== null) {
+              const correctedRelativeSeconds = (correctedTargetUs - this.mediaBaseUs) / 1000000;
+              this.audioBaseContextTime = this.audioContext.currentTime
+                - correctedRelativeSeconds / this.playbackRate;
+              const correctedAudioSeconds = this.audioContext.currentTime;
+              for (const entry of [...this.audioSources]) {
+                if (entry.startAt > correctedAudioSeconds + 0.05) {
+                  this.releaseAudioEntry(entry);
+                }
+              }
+              this.audioScheduleCursor = correctedAudioSeconds;
+            }
+            targetPtsUs = this.currentTargetUs(now);
           }
           let selected = null;
           while (this.videoFrames.length && Number(this.videoFrames[0].timestamp) <= targetPtsUs) {
@@ -719,28 +1145,29 @@
         }
       }
 
-      readFlvTag(buffer) {
+      readFlvTag(buffer, offset = 0) {
         if (!this.flvHeaderRead) {
-          if (buffer.length < 13) return null;
+          if (buffer.length - offset < 13) return null;
           if (buffer[0] !== 0x46 || buffer[1] !== 0x4c || buffer[2] !== 0x56 || buffer[3] !== 1) {
             throw new Error('FLV 头无效');
           }
-          const offset = u32(buffer, 5);
-          if (offset > 1024 * 1024) throw new Error('FLV 头偏移过大');
-          if (buffer.length < offset + 4) return null;
+          const previousTagsBytes = u32(buffer, offset + 5);
+          if (previousTagsBytes > 1024 * 1024) throw new Error('FLV 头偏移过大');
+          if (buffer.length - offset < previousTagsBytes + 4) return null;
           this.flvHeaderRead = true;
-          return { consumed: offset + 4 };
+          return { consumed: previousTagsBytes + 4 };
         }
-        if (buffer.length < 15) return null;
-        const dataSize = u24(buffer, 1);
+        if (buffer.length - offset < 15) return null;
+        const dataSize = u24(buffer, offset + 1);
         const total = 11 + dataSize + 4;
-        if (buffer.length < total) return null;
-        const timestamp = u24(buffer, 4) + buffer[7] * 0x1000000;
+        if (buffer.length - offset < total) return null;
+        const timestamp = u24(buffer, offset + 4) + buffer[offset + 7] * 0x1000000;
+        const dataStart = offset + 11;
         return {
           consumed: total,
-          type: buffer[0],
+          type: buffer[offset],
           timestampUs: timestamp * 1000,
-          data: buffer.slice(11, 11 + dataSize)
+          data: buffer.subarray(dataStart, dataStart + dataSize)
         };
       }
 
@@ -762,14 +1189,17 @@
             const result = await reader.read();
             if (result.done) break;
             if (result.value) buffer = appendBytes(buffer, result.value);
-            this.networkBufferBytes = buffer.byteLength;
-            while (buffer.length) {
-              const tag = this.readFlvTag(buffer);
+            let consumedBytes = 0;
+            while (consumedBytes < buffer.length) {
+              const tag = this.readFlvTag(buffer, consumedBytes);
               if (!tag) break;
-              buffer = buffer.slice(tag.consumed);
-              this.networkBufferBytes = buffer.byteLength;
               this.handleTag(tag);
+              consumedBytes += tag.consumed;
             }
+            if (consumedBytes > 0) {
+              buffer = buffer.slice(consumedBytes);
+            }
+            this.networkBufferBytes = buffer.byteLength;
           }
         } finally {
           reader.releaseLock();
@@ -786,6 +1216,11 @@
               await this.readConnection();
               delay = 100;
             } catch (error) {
+              if (error.name === 'AbortError' && this.recycling) {
+                this.recycling = false;
+                delay = 100;
+                continue;
+              }
               if (!this.running || this.fatal || error.name === 'AbortError') break;
               this.resetPipeline();
               setStatus(error.message + '，正在重连…');
@@ -799,9 +1234,13 @@
 
       resumeAudioFromUserGesture() {
         const context = this.createAudioContextIfNeeded();
-        if (!context) return;
+        if (!context) {
+          refreshAudioUnlockVisibility();
+          return;
+        }
         if (context.state === 'running') {
           if (this.audioConfig && !this.audioDecoder) this.configureAudio();
+          refreshAudioUnlockVisibility();
           return;
         }
         context.resume().then(() => {
@@ -809,15 +1248,23 @@
             this.closeAudioDecoder();
             this.configureAudio();
           }
-        }).catch(() => {});
+          refreshAudioUnlockVisibility();
+        }).catch(() => {
+          refreshAudioUnlockVisibility();
+        });
       }
 
       stop() {
         this.running = false;
         if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+        if (this.recycleTimer) clearInterval(this.recycleTimer);
         if (this.abortController) this.abortController.abort();
         this.resetPipeline();
-        if (this.audioContext) this.audioContext.close();
+        if (this.audioContext) {
+          const audioContext = this.audioContext;
+          this.audioContext = null;
+          void audioContext.close();
+        }
       }
     }
 
@@ -829,6 +1276,18 @@
     // 页面参数只属于播放器,不传给 FLV 服务端。
     const ownUrl = new URL(location.pathname + '.flv', location.href).href;
 
+    const audioUnlockButton = document.getElementById('audio-unlock');
+    function refreshAudioUnlockVisibility() {
+      const activeSession = sessions[0];
+      const needsUnlock = Boolean(activeSession?.running && !activeSession.fatal
+        && activeSession.audioConfig
+        && (!activeSession.audioContext || activeSession.audioContext.state !== 'running'));
+      audioUnlockButton.hidden = !needsUnlock;
+    }
+    audioUnlockButton.addEventListener('click', () => {
+      for (const activeSession of sessions) activeSession.resumeAudioFromUserGesture();
+    });
+
     function makeCanvas() {
       const canvas = document.createElement('canvas');
       grid.appendChild(canvas);
@@ -839,6 +1298,9 @@
     // 分别连接同一个服务端时间轴完成。
     const session = new StreamSession(ownPath, ownUrl, makeCanvas());
     sessions.push(session);
+    if (pageParams.get('debug') === '1') {
+      window.__livesuitePlayer = { sessions };
+    }
     session.runConnections();
     setInterval(() => {
       for (const activeSession of sessions) activeSession.sendPlaybackFeedback();

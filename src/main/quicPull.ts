@@ -919,7 +919,6 @@ export class QuicPullHub {
         'Cache-Control': 'no-store',
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Private-Network': 'true',
-        'Connection': 'close',
       });
       res.end(responseBody);
       return;
@@ -967,7 +966,6 @@ export class QuicPullHub {
         'Content-Length': Buffer.byteLength(body),
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Private-Network': 'true',
-        'Connection': 'close',
       });
       res.end(body);
       return;

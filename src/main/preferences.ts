@@ -48,7 +48,7 @@ export function createDefaultPreferences(language: AppLanguage = 'en'): UserPref
       maxLatencyMs: 150,
       replayBufferSeconds: 30,
       synchronizePullStreams: false,
-      includeAudioInPull: false,
+      includeAudioInPull: true,
     },
     rtmp: {
       port: 1935,
