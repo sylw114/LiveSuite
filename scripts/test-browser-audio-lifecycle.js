@@ -101,7 +101,7 @@ assert.match(
   /ownFlvUrl\.searchParams\.set\('livesuite-player', '1'\)/,
   'the built-in player must request browser-side scheduling headroom',
 );
-assert.match(html, /const PLAYER_BUILD_ID = 'av-independent-v4';/,
+assert.match(html, /const PLAYER_BUILD_ID = 'av-independent-v5';/,
   'runtime diagnostics must expose the watchdog build identifier');
 
 const feedbackStart = html.indexOf('async sendPlaybackFeedback() {');

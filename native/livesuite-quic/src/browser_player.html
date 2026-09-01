@@ -26,7 +26,7 @@
     // 后统一调度所有流的播放时刻。
     const SYNC_URL = '/livesuite/sync-info';
     const PLAYBACK_FEEDBACK_URL = '/livesuite/playback-feedback';
-    const PLAYER_BUILD_ID = 'av-independent-v4';
+    const PLAYER_BUILD_ID = 'av-independent-v5';
     const SYNC_POLL_MS = 1000;
     const PLAYBACK_FEEDBACK_POLL_MS = 250;
     const SYNC_REQUEST_TIMEOUT_MS = 2500;
@@ -46,24 +46,25 @@
     // 窗口，避免一次 GC 或窗口合成抖动改变长期展示节拍。
     const FRAME_RATE_SAMPLE_INTERVAL_MS = 500;
     const REQUIRED_PRESENTATION_RATIO = 0.95;
-    // 当前流的短时到达速率低于已建立的源帧率 20% 时，展示不足应归因于
-    // 源流，而不是浏览器性能。这样网络/采集端丢帧不会把本地目标帧率一并降下来。
-    const SOURCE_RATE_SHORTFALL_RATIO = 0.80;
-    // 只有源流持续低速一段时间后，才把它当作新的常态；短暂掉帧恢复后仍可
-    // 立即沿用原来的源速率基线。
-    const SOURCE_RATE_SETTLE_MS = 5000;
+    // 源端可能在静止画面主动切成可变帧率。只要当前窗口的源供给明显低于
+    // canvas 目标，就禁止用“实际呈现数不足”推断本地性能，且允许 rAF 继续
+    // 恢复本地目标。源速率永远不再成为播放器的持久帧率上限。
+    const SOURCE_SUPPLY_REQUIRED_RATIO = 0.98;
+    const SOURCE_SUPPLY_TOLERANCE_FPS = 1.5;
     // rAF 是显示器刷新驱动的。把 95% 的“展示成功率”直接乘到 rAF 上会让
     // 60Hz 显示器永远把 60fps 限制到 57fps，因此只留很小的测量容差。
     const FRAME_RATE_RAF_TOLERANCE_FPS = 1.5;
     const FRAME_RATE_EPSILON_FPS = 0.25;
     const FRAME_RATE_LIMITED_SAMPLES_BEFORE_DECREASE = 2;
-    const STABLE_SAMPLES_BEFORE_INCREASE = 6;
-    // 恢复后的高帧率先作为探测档运行。若探测很快失败，逐次延长下一次
-    // 探测间隔；若稳定运行满窗口则清除退避。这样既不会永久锁在低帧率，
-    // 也不会在设备真实能力不足时每几秒来回切换节拍。
-    const FRAME_RATE_RECOVERY_PROBE_SUCCESS_SAMPLES = 6;
-    const FRAME_RATE_RECOVERY_BACKOFF_BASE_SAMPLES = 6;
-    const FRAME_RATE_RECOVERY_BACKOFF_MAX_SAMPLES = 120;
+    const FRAME_RATE_HEALTHY_SAMPLES_BEFORE_INCREASE = 2;
+    // 控制目标是连续值，不再使用 60/30/20 等固定档位。下降速度跟随实际
+    // 达标率，恢复速度跟随已证明的余量；单次调整限幅仅用于避免控制振荡。
+    const FRAME_RATE_CAPACITY_DECREASE_ALPHA = 0.5;
+    const FRAME_RATE_CAPACITY_RECOVERY_ALPHA = 0.08;
+    const FRAME_RATE_SOURCE_RECOVERY_ALPHA = 0.5;
+    const FRAME_RATE_MAX_DECREASE_FRACTION = 0.15;
+    const FRAME_RATE_MAX_INCREASE_FRACTION = 0.20;
+    const FRAME_RATE_MIN_ADJUSTMENT_FPS = 0.5;
     const VIDEO_PRESENTATION_EPSILON_MS = 0.25;
     const MAX_AUDIO_INPUT = 300;
     // alignmentDelay/audiolatent 各允许 60 秒并可叠加。96 kHz AAC 每秒最多
@@ -532,22 +533,6 @@
       try { return decodeURIComponent(value); } catch (_) { return value; }
     }
 
-    function cadenceAtOrBelow(maximumFps, capacityFps) {
-      const maximum = clampNumber(maximumFps, MIN_TARGET_VIDEO_FPS, MAX_TARGET_VIDEO_FPS);
-      const capacity = clampNumber(capacityFps, MIN_TARGET_VIDEO_FPS, maximum);
-      const divisor = Math.max(1, Math.ceil(
-        maximum / (capacity + FRAME_RATE_EPSILON_FPS),
-      ));
-      return Math.max(MIN_TARGET_VIDEO_FPS, maximum / divisor);
-    }
-
-    function nextHigherCadence(maximumFps, currentFps) {
-      const maximum = clampNumber(maximumFps, MIN_TARGET_VIDEO_FPS, MAX_TARGET_VIDEO_FPS);
-      if (currentFps >= maximum - FRAME_RATE_EPSILON_FPS) return maximum;
-      const divisor = Math.max(2, Math.round(maximum / Math.max(1, currentFps)));
-      return maximum / (divisor - 1);
-    }
-
     function advanceVideoPresentationDeadline(deadlineMs, nowMs, targetFps) {
       const intervalMs = 1000 / Math.max(1, targetFps);
       if (!Number.isFinite(deadlineMs)) return nowMs + intervalMs;
@@ -560,9 +545,9 @@
       return deadlineMs + missedIntervals * intervalMs;
     }
 
-    // 将“源流供给不足”和“本地展示性能不足”分开判断。降档只选显示上限的
-    // 整数分频（例如 60 -> 30 -> 20），让丢帧均匀分布，避免 54fps 之类目标
-    // 在 60Hz rAF 上形成周期性的短-短-长帧。
+    // 以真实达标率连续估算本地呈现容量。源供给不足时 presentationRatio
+    // 没有本地性能含义，因此只使用 rAF/长帧信号，并用健康 rAF 快速恢复
+    // 容量估计。目标变化仍由绝对截止时间均匀摊开，不会集中丢一段画面。
     function evaluateFrameRateControl({
       targetVideoFps,
       preferredVideoFps,
@@ -570,11 +555,10 @@
       presentationRatio,
       longRafRatio,
       sourceLimited,
+      measurementSuspended,
+      capacityEstimateFps,
       stableSamples,
       limitedSamples,
-      recoveryCooldownSamples,
-      recoveryBackoffSamples,
-      recoveryProbeSamples,
     }) {
       const target = clampNumber(
         Number.isFinite(targetVideoFps) ? targetVideoFps : INITIAL_TARGET_VIDEO_FPS,
@@ -587,51 +571,71 @@
         MAX_TARGET_VIDEO_FPS,
       );
       const measuredRafFps = Number.isFinite(rafFps) && rafFps > 0 ? rafFps : preferred;
-      const displayCapacityLimited = target
-        > measuredRafFps + FRAME_RATE_RAF_TOLERANCE_FPS;
-      const roundedRafCapacity = Math.max(
-        MIN_TARGET_VIDEO_FPS,
-        Math.round(measuredRafFps + (displayCapacityLimited ? 0 : 0.5)),
+      const maximumFps = preferred;
+      const displayMaximumFps = Math.min(
+        maximumFps,
+        Math.max(MIN_TARGET_VIDEO_FPS, measuredRafFps + FRAME_RATE_RAF_TOLERANCE_FPS),
       );
-      const maximumFps = Math.min(
-        preferred,
-        displayCapacityLimited
-          ? roundedRafCapacity
-          : Math.max(target, roundedRafCapacity),
+      const capacityEstimate = clampNumber(
+        Number.isFinite(capacityEstimateFps) ? capacityEstimateFps : target,
+        MIN_TARGET_VIDEO_FPS,
+        maximumFps,
       );
       const stable = clampNumber(
         Math.floor(Number.isFinite(stableSamples) ? stableSamples : 0),
         0,
-        STABLE_SAMPLES_BEFORE_INCREASE,
+        FRAME_RATE_HEALTHY_SAMPLES_BEFORE_INCREASE,
       );
       const limited = clampNumber(
         Math.floor(Number.isFinite(limitedSamples) ? limitedSamples : 0),
         0,
         FRAME_RATE_LIMITED_SAMPLES_BEFORE_DECREASE,
       );
-      const recoveryCooldown = clampNumber(
-        Math.floor(Number.isFinite(recoveryCooldownSamples) ? recoveryCooldownSamples : 0),
+      if (measurementSuspended === true) {
+        return {
+          targetVideoFps: target,
+          capacityEstimateFps: capacityEstimate,
+          achievementRatio: 1,
+          stableSamples: 0,
+          limitedSamples: 0,
+          maximumFps: displayMaximumFps,
+          reason: 'measurement-suspended',
+        };
+      }
+
+      const rafAchievement = clampNumber(
+        (measuredRafFps + FRAME_RATE_RAF_TOLERANCE_FPS) / Math.max(1, target),
         0,
-        FRAME_RATE_RECOVERY_BACKOFF_MAX_SAMPLES,
+        1,
       );
-      const recoveryBackoff = clampNumber(
-        Math.floor(Number.isFinite(recoveryBackoffSamples) ? recoveryBackoffSamples : 0),
-        0,
-        FRAME_RATE_RECOVERY_BACKOFF_MAX_SAMPLES,
+      const timingAchievement = clampNumber(
+        1 - (Number.isFinite(longRafRatio) ? Math.max(0, longRafRatio) : 0),
+        0.5,
+        1,
       );
-      const recoveryProbe = clampNumber(
-        Math.floor(Number.isFinite(recoveryProbeSamples) ? recoveryProbeSamples : 0),
-        0,
-        FRAME_RATE_RECOVERY_PROBE_SUCCESS_SAMPLES,
+      const outputAchievement = sourceLimited === true
+        ? 1
+        : clampNumber(
+          Number.isFinite(presentationRatio) ? presentationRatio : 1,
+          0,
+          1,
+        );
+      const achievementRatio = Math.min(
+        rafAchievement,
+        timingAchievement,
+        outputAchievement,
       );
-      // decodeQueueSize 的正常高水位不代表降低 canvas 呈现频率能缓解压力：
-      // H.264 参考帧仍必须全部解码。这里只依据真实的 rAF/呈现缺口降档，
-      // 避免解码泵长期保持 7–8 个任务时把目标帧率永久锁死。
-      const localPerformanceLimited = displayCapacityLimited
-        || longRafRatio > 1 - REQUIRED_PRESENTATION_RATIO
-        || (sourceLimited !== true && presentationRatio < REQUIRED_PRESENTATION_RATIO);
+      const localPerformanceLimited = achievementRatio < REQUIRED_PRESENTATION_RATIO;
 
       if (localPerformanceLimited) {
+        const observedCapacityFps = Math.min(
+          displayMaximumFps,
+          Math.max(MIN_TARGET_VIDEO_FPS, target * achievementRatio),
+        );
+        const nextCapacityEstimate = observedCapacityFps >= capacityEstimate
+          ? observedCapacityFps
+          : capacityEstimate + (observedCapacityFps - capacityEstimate)
+            * FRAME_RATE_CAPACITY_DECREASE_ALPHA;
         const nextLimitedSamples = Math.min(
           FRAME_RATE_LIMITED_SAMPLES_BEFORE_DECREASE,
           limited + 1,
@@ -639,116 +643,91 @@
         if (nextLimitedSamples < FRAME_RATE_LIMITED_SAMPLES_BEFORE_DECREASE) {
           return {
             targetVideoFps: target,
-            // 单个大帧、GC 或合成抖动只扣除一次恢复信用，不把此前连续
-            // 健康窗口全部清零。只有压力连续存在并真正降档时才重新计时。
-            stableSamples: Math.max(0, stable - 1),
+            capacityEstimateFps: nextCapacityEstimate,
+            achievementRatio,
+            stableSamples: 0,
             limitedSamples: nextLimitedSamples,
-            recoveryCooldownSamples: recoveryCooldown,
-            recoveryBackoffSamples: recoveryBackoff,
-            recoveryProbeSamples: recoveryProbe,
-            maximumFps,
-            reason: displayCapacityLimited
-              ? 'display-capacity-pending'
-              : 'local-performance-pending',
+            maximumFps: displayMaximumFps,
+            reason: 'adaptive-decrease-pending',
           };
         }
-        const measuredCapacity = displayCapacityLimited
-          ? maximumFps
-          : target * clampNumber(presentationRatio, 0.5, REQUIRED_PRESENTATION_RATIO);
-        const nextTarget = cadenceAtOrBelow(
-          Math.max(target, maximumFps),
-          Math.min(maximumFps, measuredCapacity),
+        const desiredTarget = Math.min(
+          displayMaximumFps,
+          nextCapacityEstimate / REQUIRED_PRESENTATION_RATIO,
         );
-        const failedRecoveryProbe = recoveryProbe > 0
-          && nextTarget + FRAME_RATE_EPSILON_FPS < target;
-        const nextRecoveryBackoff = failedRecoveryProbe
-          ? Math.min(
-            FRAME_RATE_RECOVERY_BACKOFF_MAX_SAMPLES,
-            recoveryBackoff > 0
-              ? recoveryBackoff * 2
-              : FRAME_RATE_RECOVERY_BACKOFF_BASE_SAMPLES,
-          )
-          : recoveryBackoff;
+        const minimumStepTarget = target * (1 - FRAME_RATE_MAX_DECREASE_FRACTION);
+        const nextTarget = clampNumber(
+          Math.max(desiredTarget, minimumStepTarget),
+          MIN_TARGET_VIDEO_FPS,
+          target,
+        );
         return {
           targetVideoFps: nextTarget,
+          capacityEstimateFps: nextCapacityEstimate,
+          achievementRatio,
           stableSamples: 0,
           limitedSamples: 0,
-          recoveryCooldownSamples: failedRecoveryProbe
-            ? nextRecoveryBackoff
-            : nextTarget + FRAME_RATE_EPSILON_FPS < target
-              ? recoveryBackoff
-              : recoveryCooldown,
-          recoveryBackoffSamples: nextRecoveryBackoff,
-          recoveryProbeSamples: 0,
-          maximumFps,
-          reason: displayCapacityLimited ? 'display-capacity' : 'local-performance',
+          maximumFps: displayMaximumFps,
+          reason: 'adaptive-decrease',
         };
       }
 
-      if (sourceLimited === true) {
-        return {
-          targetVideoFps: target,
-          // 源供给不足既不能证明本地仍有余量，也不能证明本地能力变差；
-          // 暂停恢复进度，等源回来后从原信用继续，而不是永久锁在低档。
-          stableSamples: stable,
-          limitedSamples: 0,
-          recoveryCooldownSamples: recoveryCooldown,
-          recoveryBackoffSamples: recoveryBackoff,
-          recoveryProbeSamples: recoveryProbe,
-          maximumFps,
-          reason: 'source-limited',
-        };
-      }
-
-      if (recoveryCooldown > 0) {
-        return {
-          targetVideoFps: target,
-          stableSamples: stable,
-          limitedSamples: 0,
-          recoveryCooldownSamples: recoveryCooldown - 1,
-          recoveryBackoffSamples: recoveryBackoff,
-          recoveryProbeSamples: recoveryProbe,
-          maximumFps,
-          reason: 'recovery-cooldown',
-        };
-      }
-
-      let nextRecoveryProbe = recoveryProbe;
-      let nextRecoveryBackoff = recoveryBackoff;
-      if (nextRecoveryProbe > 0) {
-        nextRecoveryProbe++;
-        if (nextRecoveryProbe >= FRAME_RATE_RECOVERY_PROBE_SUCCESS_SAMPLES) {
-          nextRecoveryProbe = 0;
-          nextRecoveryBackoff = 0;
-        }
-      }
-      const canRecover = target + FRAME_RATE_EPSILON_FPS < maximumFps;
+      const demonstratedCapacityFps = Math.max(
+        capacityEstimate,
+        Math.min(displayMaximumFps, target * achievementRatio),
+      );
+      const recoveryStrength = clampNumber(
+        (achievementRatio - REQUIRED_PRESENTATION_RATIO)
+          / (1 - REQUIRED_PRESENTATION_RATIO),
+        0,
+        1,
+      );
+      const recoveryAlpha = sourceLimited === true
+        ? FRAME_RATE_SOURCE_RECOVERY_ALPHA
+        : FRAME_RATE_CAPACITY_RECOVERY_ALPHA * recoveryStrength;
+      const nextCapacityEstimate = demonstratedCapacityFps
+        + (displayMaximumFps - demonstratedCapacityFps) * recoveryAlpha;
+      const canRecover = target + FRAME_RATE_EPSILON_FPS < displayMaximumFps
+        && nextCapacityEstimate / REQUIRED_PRESENTATION_RATIO
+          > target + FRAME_RATE_EPSILON_FPS;
       const nextStableSamples = canRecover
-        ? Math.min(STABLE_SAMPLES_BEFORE_INCREASE, stable + 1)
+        ? Math.min(FRAME_RATE_HEALTHY_SAMPLES_BEFORE_INCREASE, stable + 1)
         : 0;
-      if (nextStableSamples >= STABLE_SAMPLES_BEFORE_INCREASE
-        && canRecover) {
+      if (nextStableSamples >= FRAME_RATE_HEALTHY_SAMPLES_BEFORE_INCREASE) {
+        const desiredTarget = Math.min(
+          displayMaximumFps,
+          nextCapacityEstimate / REQUIRED_PRESENTATION_RATIO,
+        );
+        const desiredStep = Math.max(
+          FRAME_RATE_MIN_ADJUSTMENT_FPS,
+          desiredTarget - target,
+        );
+        const maximumStep = Math.max(
+          FRAME_RATE_MIN_ADJUSTMENT_FPS,
+          target * FRAME_RATE_MAX_INCREASE_FRACTION,
+        );
         return {
-          targetVideoFps: nextHigherCadence(maximumFps, target),
+          targetVideoFps: Math.min(
+            displayMaximumFps,
+            target + Math.min(desiredStep, maximumStep),
+          ),
+          capacityEstimateFps: nextCapacityEstimate,
+          achievementRatio,
           stableSamples: 0,
           limitedSamples: 0,
-          recoveryCooldownSamples: 0,
-          recoveryBackoffSamples: nextRecoveryBackoff,
-          recoveryProbeSamples: 1,
-          maximumFps,
-          reason: 'recover',
+          maximumFps: displayMaximumFps,
+          reason: sourceLimited === true ? 'source-independent-recover' : 'adaptive-increase',
         };
       }
 
       return {
         targetVideoFps: target,
+        capacityEstimateFps: nextCapacityEstimate,
+        achievementRatio,
         stableSamples: nextStableSamples,
         limitedSamples: 0,
-        recoveryCooldownSamples: 0,
-        recoveryBackoffSamples: nextRecoveryBackoff,
-        recoveryProbeSamples: nextRecoveryProbe,
-        maximumFps,
-        reason: 'steady',
+        maximumFps: displayMaximumFps,
+        reason: sourceLimited === true ? 'source-independent' : 'steady',
       };
     }
 
@@ -773,17 +752,19 @@
 
     function evaluateSourceAvailability({
       targetVideoFps,
-      sourceNominalVideoFps,
       sourceArrivalFps,
       sourcePtsFps,
     }) {
-      const expectedFps = sourceNominalVideoFps > 0
-        ? Math.min(targetVideoFps, sourceNominalVideoFps)
-        : targetVideoFps;
-      const sourceLimited = sourceNominalVideoFps > 0
-        && (sourceArrivalFps < expectedFps * SOURCE_RATE_SHORTFALL_RATIO
-          || (sourcePtsFps > 0 && sourcePtsFps < expectedFps * SOURCE_RATE_SHORTFALL_RATIO));
-      return { expectedFps, sourceLimited };
+      const target = Math.max(1, Number.isFinite(targetVideoFps) ? targetVideoFps : 1);
+      const arrivalFps = Math.max(0, Number.isFinite(sourceArrivalFps) ? sourceArrivalFps : 0);
+      const ptsFps = Math.max(0, Number.isFinite(sourcePtsFps) ? sourcePtsFps : 0);
+      // PTS 足够时同时要求真实媒体速率与到达速率，避免网络追赶突发把源供给
+      // 夸大；低帧率窗口只有一帧时退回到达率，并直接归类为 sourceLimited。
+      const sourceSupplyFps = ptsFps > 0 ? Math.min(arrivalFps, ptsFps) : arrivalFps;
+      const expectedFps = Math.min(target, sourceSupplyFps);
+      const sourceLimited = sourceSupplyFps + SOURCE_SUPPLY_TOLERANCE_FPS
+        < target * SOURCE_SUPPLY_REQUIRED_RATIO;
+      return { expectedFps, sourceLimited, sourceSupplyFps };
     }
 
     // ============ 单流播放会话 ============
@@ -825,8 +806,6 @@
         // 而下调；target 才是依据本地展示性能临时探测出来的当前上限。
         this.preferredVideoFps = INITIAL_TARGET_VIDEO_FPS;
         this.sourceVideoFps = 0;
-        this.sourceNominalVideoFps = 0;
-        this.sourceRateLowSinceMs = null;
         this.sampledVideoFrames = 0;
         this.nextVideoPresentationMs = null;
         this.lastVideoPresentationMs = null;
@@ -841,11 +820,9 @@
         this.frameRateWindowSourceFrames = 0;
         this.frameRateWindowSourceFirstPtsUs = null;
         this.frameRateWindowSourceLastPtsUs = null;
+        this.frameRateCapacityEstimateFps = INITIAL_TARGET_VIDEO_FPS;
         this.frameRateStableSamples = 0;
         this.frameRateLimitedSamples = 0;
-        this.frameRateRecoveryCooldownSamples = 0;
-        this.frameRateRecoveryBackoffSamples = 0;
-        this.frameRateRecoveryProbeSamples = 0;
         this.lastMeasuredRafFps = 0;
         this.lastMeasuredPresentationFps = 0;
         this.lastPresentationIntervalVarianceMs2 = 0;
@@ -858,6 +835,8 @@
         this.lastSourceLimited = false;
         this.lastSourceRecovering = false;
         this.lastFrameRateBacklogged = false;
+        this.lastFrameRateAchievement = 1;
+        this.lastFrameRateControlReason = 'initial';
         this.audioContext = null;
         this.audioConfig = null;
         this.audioConfigKey = '';
@@ -961,11 +940,11 @@
         this.lastDisplayedPtsUs = null;
         this.nextVideoPresentationMs = null;
         this.lastVideoPresentationMs = null;
+        this.frameRateCapacityEstimateFps = this.preferredVideoFps;
         this.frameRateStableSamples = 0;
         this.frameRateLimitedSamples = 0;
-        this.frameRateRecoveryCooldownSamples = 0;
-        this.frameRateRecoveryBackoffSamples = 0;
-        this.frameRateRecoveryProbeSamples = 0;
+        this.lastFrameRateAchievement = 1;
+        this.lastFrameRateControlReason = 'pipeline-reset';
         if (this.context) this.context.clearRect(0, 0, this.canvas.width, this.canvas.height);
       }
 
@@ -1188,29 +1167,19 @@
         }
       }
 
-      updateSourceVideoRate(measuredFps, now) {
+      updateSourceVideoRate(measuredFps) {
         if (!Number.isFinite(measuredFps) || measuredFps <= 0) return;
         const boundedFps = Math.min(MAX_TARGET_VIDEO_FPS, measuredFps);
-        this.sourceVideoFps = boundedFps;
-        if (this.sourceNominalVideoFps <= 0) {
-          this.sourceNominalVideoFps = boundedFps;
-          this.sourceRateLowSinceMs = null;
-        } else if (boundedFps >= this.sourceNominalVideoFps * SOURCE_RATE_SHORTFALL_RATIO) {
-          this.sourceRateLowSinceMs = null;
-          if (boundedFps > this.sourceNominalVideoFps + FRAME_RATE_EPSILON_FPS) {
-            this.sourceNominalVideoFps = boundedFps;
-          }
-        } else if (this.sourceRateLowSinceMs === null) {
-          this.sourceRateLowSinceMs = now;
-        } else if (now - this.sourceRateLowSinceMs >= SOURCE_RATE_SETTLE_MS) {
-          // 连续低速才更新基线：永久改成低帧率的流能被正确衡量，而短暂
-          // 网络抖动不会把后续恢复帧率锁死在较低目标上。
-          this.sourceNominalVideoFps = boundedFps;
-          this.sourceRateLowSinceMs = null;
+        if (this.sourceVideoFps <= 0) {
+          this.sourceVideoFps = boundedFps;
+        } else {
+          // 仅作为诊断与轻微提前呈现量的当前源速率；快速跟随上升、缓慢跟随
+          // 静止画面的 VFR 下降，但绝不用于下调本地 target/preferred。
+          const alpha = boundedFps >= this.sourceVideoFps ? 0.5 : 0.2;
+          this.sourceVideoFps += (boundedFps - this.sourceVideoFps) * alpha;
         }
-
-        if (this.sourceNominalVideoFps > this.preferredVideoFps + FRAME_RATE_EPSILON_FPS) {
-          this.preferredVideoFps = Math.min(MAX_TARGET_VIDEO_FPS, this.sourceNominalVideoFps);
+        if (boundedFps > this.preferredVideoFps + FRAME_RATE_EPSILON_FPS) {
+          this.preferredVideoFps = boundedFps;
         }
       }
 
@@ -1304,12 +1273,11 @@
         this.lastMeasuredSourcePtsFps = sourceRate.sourcePtsFps;
         this.lastMeasuredSourceFps = sourceRate.measuredSourceFps;
         if (sourceFrameCount >= 2) {
-          this.updateSourceVideoRate(sourceRate.measuredSourceFps, now);
+          this.updateSourceVideoRate(sourceRate.measuredSourceFps);
         }
 
         const sourceAvailability = evaluateSourceAvailability({
           targetVideoFps: this.targetVideoFps,
-          sourceNominalVideoFps: this.sourceNominalVideoFps,
           sourceArrivalFps: sourceRate.sourceArrivalFps,
           sourcePtsFps: sourceRate.sourcePtsFps,
         });
@@ -1352,34 +1320,34 @@
         // 仅保留为 debug 诊断；它不能进入展示帧率控制，因为降低 canvas
         // 频率不会减少预测编码视频必须执行的解码工作。
         this.lastFrameRateBacklogged = decoderBacklogged;
-        if (this.sourceNominalVideoFps > 0 && hasRecentVideoOutput
-          && Number.isFinite(rafFps) && rafFps > 0) {
+        if (Number.isFinite(rafFps) && rafFps > 0) {
           const control = evaluateFrameRateControl({
             targetVideoFps: this.targetVideoFps,
             preferredVideoFps: this.preferredVideoFps,
             rafFps,
             presentationRatio,
             longRafRatio,
-            // 等关键帧也属于流/传输侧暂时不能供给可展示画面的状态；此时
-            // 降低 canvas 采样目标无法解决问题，反而会拖慢恢复后的展示。
-            sourceLimited: sourceLimited || sourceRecovering || this.waitingForKeyframe,
+            // 源 VFR、断流、刚恢复或等待关键帧时，呈现数不能代表本地性能。
+            // 控制器仍使用健康 rAF 恢复目标，因此静止画面不会冻结低帧率。
+            sourceLimited: sourceLimited || sourceRecovering
+              || this.waitingForKeyframe || !hasRecentVideoOutput,
+            measurementSuspended: document.hidden,
+            capacityEstimateFps: this.frameRateCapacityEstimateFps,
             stableSamples: this.frameRateStableSamples,
             limitedSamples: this.frameRateLimitedSamples,
-            recoveryCooldownSamples: this.frameRateRecoveryCooldownSamples,
-            recoveryBackoffSamples: this.frameRateRecoveryBackoffSamples,
-            recoveryProbeSamples: this.frameRateRecoveryProbeSamples,
           });
           this.setTargetVideoFps(control.targetVideoFps);
+          this.frameRateCapacityEstimateFps = control.capacityEstimateFps;
           this.frameRateStableSamples = control.stableSamples;
           this.frameRateLimitedSamples = control.limitedSamples;
-          this.frameRateRecoveryCooldownSamples = control.recoveryCooldownSamples;
-          this.frameRateRecoveryBackoffSamples = control.recoveryBackoffSamples;
-          this.frameRateRecoveryProbeSamples = control.recoveryProbeSamples;
+          this.lastFrameRateAchievement = control.achievementRatio;
+          this.lastFrameRateControlReason = control.reason;
         } else {
-          // 尚未建立源帧率基线或已彻底停流时，不根据空窗口降低目标；等源帧
-          // 回来后再用新的到达样本判断，避免把一次断流固化成低帧率设置。
-          this.frameRateStableSamples = Math.max(0, this.frameRateStableSamples - 1);
+          // 无有效 rAF 样本时既不降低容量估计也不累计恢复，等待可见页面的
+          // 下一窗口重新判断。
+          this.frameRateStableSamples = 0;
           this.frameRateLimitedSamples = 0;
+          this.lastFrameRateControlReason = 'invalid-raf-sample';
         }
 
         this.frameRateWindowStartMs = now;
@@ -1496,11 +1464,11 @@
         this.startPerfMs = null;
         this.lastInputPtsUs = null;
         this.lastDisplayedPtsUs = null;
+        this.frameRateCapacityEstimateFps = this.preferredVideoFps;
         this.frameRateStableSamples = 0;
         this.frameRateLimitedSamples = 0;
-        this.frameRateRecoveryCooldownSamples = 0;
-        this.frameRateRecoveryBackoffSamples = 0;
-        this.frameRateRecoveryProbeSamples = 0;
+        this.lastFrameRateAchievement = 1;
+        this.lastFrameRateControlReason = 'realignment-reset';
         if (this.context) this.context.clearRect(0, 0, this.canvas.width, this.canvas.height);
         setStatus('正在重新对齐播放器时钟…');
       }
@@ -1980,8 +1948,8 @@
             targetPtsUs = this.currentTargetUs(now);
           }
           if (!this.videoPresentationIsDue(now)) return;
-          const earlyPresentationUs = this.sourceNominalVideoFps > 0
-            ? Math.min(8000, 500000 / this.sourceNominalVideoFps)
+          const earlyPresentationUs = this.sourceVideoFps > 0
+            ? Math.min(8000, 500000 / this.sourceVideoFps)
             : 0;
           let selected = null;
           while (this.videoFrames.length

@@ -54,9 +54,9 @@ assert.strictEqual(audio.audioScheduleRecoveryReason({
   maximumAheadSeconds: 122,
 }), 'source-limit');
 
-const videoStart = html.indexOf('function cadenceAtOrBelow(');
+const videoStart = html.indexOf('function advanceVideoPresentationDeadline(');
 const videoEnd = html.indexOf('function evaluateFrameRateControl(', videoStart);
-assert.ok(videoStart >= 0 && videoEnd > videoStart, 'video cadence helpers were not found');
+assert.ok(videoStart >= 0 && videoEnd > videoStart, 'video pacing helper was not found');
 const video = new Function(
   'const MIN_TARGET_VIDEO_FPS = 12;\n'
     + 'const MAX_TARGET_VIDEO_FPS = 240;\n'
@@ -68,9 +68,9 @@ const video = new Function(
 )();
 
 const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
-const deadline = video.advanceVideoPresentationDeadline(1, thirtyDaysMs, 60);
+const deadline = video.advanceVideoPresentationDeadline(1, thirtyDaysMs, 53.7);
 assert.ok(deadline > thirtyDaysMs);
-assert.ok(deadline - thirtyDaysMs <= 1000 / 60 + 0.001);
+assert.ok(deadline - thirtyDaysMs <= 1000 / 53.7 + 0.001);
 
 const unwrapStart = html.indexOf('function unwrapFlvTimestampMs(');
 const unwrapEnd = html.indexOf('function signed24(', unwrapStart);
