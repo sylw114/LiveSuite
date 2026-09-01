@@ -26,6 +26,7 @@
     // 后统一调度所有流的播放时刻。
     const SYNC_URL = '/livesuite/sync-info';
     const PLAYBACK_FEEDBACK_URL = '/livesuite/playback-feedback';
+    const PLAYER_BUILD_ID = 'av-independent-v4';
     const SYNC_POLL_MS = 1000;
     const PLAYBACK_FEEDBACK_POLL_MS = 250;
     const SYNC_REQUEST_TIMEOUT_MS = 2500;
@@ -41,18 +42,52 @@
     const INITIAL_TARGET_VIDEO_FPS = 60;
     const MIN_TARGET_VIDEO_FPS = 12;
     const MAX_TARGET_VIDEO_FPS = 240;
-    const FRAME_RATE_SAMPLE_INTERVAL_MS = 1000;
+    // 半秒窗口用于检测持续的本地性能压力；真正降档前还要连续命中多个
+    // 窗口，避免一次 GC 或窗口合成抖动改变长期展示节拍。
+    const FRAME_RATE_SAMPLE_INTERVAL_MS = 500;
     const REQUIRED_PRESENTATION_RATIO = 0.95;
-    // 超出承载能力时每个采样周期只下调 10%。这样播放端始终展示最新的
-    // 已采样画面，不会通过一次性清掉半秒队列来“追帧”。
-    const FRAME_RATE_DECREASE_RATIO = 0.90;
-    const FRAME_RATE_INCREASE_RATIO = 1.03;
-    const STABLE_SAMPLES_BEFORE_INCREASE = 4;
+    // 当前流的短时到达速率低于已建立的源帧率 20% 时，展示不足应归因于
+    // 源流，而不是浏览器性能。这样网络/采集端丢帧不会把本地目标帧率一并降下来。
+    const SOURCE_RATE_SHORTFALL_RATIO = 0.80;
+    // 只有源流持续低速一段时间后，才把它当作新的常态；短暂掉帧恢复后仍可
+    // 立即沿用原来的源速率基线。
+    const SOURCE_RATE_SETTLE_MS = 5000;
+    // rAF 是显示器刷新驱动的。把 95% 的“展示成功率”直接乘到 rAF 上会让
+    // 60Hz 显示器永远把 60fps 限制到 57fps，因此只留很小的测量容差。
+    const FRAME_RATE_RAF_TOLERANCE_FPS = 1.5;
+    const FRAME_RATE_EPSILON_FPS = 0.25;
+    const FRAME_RATE_LIMITED_SAMPLES_BEFORE_DECREASE = 2;
+    const STABLE_SAMPLES_BEFORE_INCREASE = 6;
+    // 恢复后的高帧率先作为探测档运行。若探测很快失败，逐次延长下一次
+    // 探测间隔；若稳定运行满窗口则清除退避。这样既不会永久锁在低帧率，
+    // 也不会在设备真实能力不足时每几秒来回切换节拍。
+    const FRAME_RATE_RECOVERY_PROBE_SUCCESS_SAMPLES = 6;
+    const FRAME_RATE_RECOVERY_BACKOFF_BASE_SAMPLES = 6;
+    const FRAME_RATE_RECOVERY_BACKOFF_MAX_SAMPLES = 120;
+    const VIDEO_PRESENTATION_EPSILON_MS = 0.25;
     const MAX_AUDIO_INPUT = 300;
-    const MAX_AUDIO_SOURCES = 1024;
+    // alignmentDelay/audiolatent 各允许 60 秒并可叠加。96 kHz AAC 每秒最多
+    // 约 94 个 1024-sample PCM 块，因此硬上限必须覆盖合法的 120 秒延迟，
+    // 不能把节点数当成播放管线故障。时间跨度另由 schedule-ahead 上限约束。
+    const MAX_AUDIO_SOURCES = 16384;
     const MAX_AUDIO_LATE_SCHEDULE_SECONDS = 0.25;
-    const PIPELINE_RECYCLE_INTERVAL_MS = 2 * 60 * 60 * 1000;
-    const DEGRADED_RECYCLE_SAMPLES = 40;
+    const AUDIO_SCHEDULE_LEAD_SECONDS = 0.015;
+    const AUDIO_CONTIGUITY_TOLERANCE_US = 3000;
+    const MAX_PRESERVED_AUDIO_SOURCE_SECONDS = 0.5;
+    const AUDIO_RECOVERY_STATUS_INTERVAL_MS = 1000;
+    // 解码输出看门狗按 AAC 帧时长动态放宽；48/96 kHz 下约 120ms，低采样率
+    // 最多 600ms。检测同时要求输入仍活跃且声卡前缓冲即将耗尽。
+    const MIN_AUDIO_DECODER_STALL_MS = 120;
+    const MAX_AUDIO_DECODER_STALL_MS = 600;
+    const AUDIO_INPUT_ACTIVE_WINDOW_MS = 1000;
+    const AUDIO_DECODER_RECOVERY_COOLDOWN_MS = 250;
+    const AUDIO_CONTEXT_RESUME_RETRY_MS = 1000;
+    // 做了 PCM 域 WSOLA 时间伸缩，以防止出现 AudioBufferSourceNode
+    // playbackRate 重采样把控速直接变成音高变化的情况。
+    const AUDIO_STRETCH_GRAIN_SAMPLES = 256;
+    const AUDIO_STRETCH_SEARCH_SAMPLES = 32;
+    const DEGRADED_VIDEO_RECOVERY_SAMPLES = 40;
+    const FLV_TIMESTAMP_MODULUS_MS = 0x100000000;
 
     // 服务端时钟估算：offset = serverEpochMs - performance.now()。多次取样
     // 后取最小 RTT 的样本，降低网络抖动对时钟换算的影响。
@@ -114,6 +149,7 @@
     }
 
     function refreshSyncInfo() {
+      if (syncRequestInFlight) return;
       const t0 = performance.now();
       const syncQuery = '?t0=' + encodeURIComponent(t0)
         + '&clientId=' + encodeURIComponent(playbackClientId)
@@ -131,9 +167,8 @@
           if (Number.isFinite(info.alignmentDelayMs) && info.alignmentDelayMs > 0) {
             alignmentDelayMs = info.alignmentDelayMs;
           }
-          if (Number.isFinite(info.playbackRate)) {
-            applyPlaybackRate(info.playbackRate, ownPath);
-          }
+          // 做了时钟同步与控速处理的职责拆分，以防止出现同步轮询重复覆盖
+          // 播放端当前控速的情况。控速只由 playback-feedback 响应处理。
           if (Array.isArray(info.streams)) {
             originByPath.clear();
             for (const entry of info.streams) {
@@ -183,6 +218,17 @@
     function u32(data, offset) {
       return (data[offset] * 0x1000000) + (data[offset + 1] << 16) +
         (data[offset + 2] << 8) + data[offset + 3];
+    }
+
+    function unwrapFlvTimestampMs(rawTimestampMs, previousTimestampMs, expectedTimestampMs) {
+      const reference = Number.isFinite(expectedTimestampMs)
+        ? expectedTimestampMs
+        : previousTimestampMs;
+      if (!Number.isFinite(reference)) return rawTimestampMs;
+      const wrapCount = Math.max(0, Math.round(
+        (reference - rawTimestampMs) / FLV_TIMESTAMP_MODULUS_MS,
+      ));
+      return rawTimestampMs + wrapCount * FLV_TIMESTAMP_MODULUS_MS;
     }
 
     function signed24(data, offset) {
@@ -239,8 +285,505 @@
       };
     }
 
+    function clampNumber(value, minimum, maximum) {
+      return Math.min(maximum, Math.max(minimum, value));
+    }
+
+    // 做了面向 0.9–1.1 小幅实时控速的 Waveform Similarity Overlap-Add，
+    // 以防止出现常规重采样导致变调的情况。极短 PCM 帧保持原样，以防止
+    // 出现窗口不足时产生明显拼接伪影的情况。
+    function stretchedAudioFrameCount(inputFrames, rate, remainder = 0) {
+      const boundedRate = clampNumber(rate, 0.9, 1.1);
+      const exactFrames = inputFrames / boundedRate + remainder;
+      const frameCount = Math.max(1, Math.round(exactFrames));
+      return {
+        frameCount,
+        remainder: exactFrames - frameCount,
+      };
+    }
+
+    function stretchAudioPlanes(planes, rate, requestedOutputFrames = null) {
+      const inputFrames = planes[0]?.length || 0;
+      const outputFrames = Number.isFinite(requestedOutputFrames)
+        ? Math.max(1, Math.round(requestedOutputFrames))
+        : Math.max(1, Math.round(inputFrames / rate));
+      if ((Math.abs(rate - 1) < 0.001 && outputFrames === inputFrames)
+        || inputFrames < AUDIO_STRETCH_GRAIN_SAMPLES * 2) {
+        return planes;
+      }
+      const grainSize = Math.min(AUDIO_STRETCH_GRAIN_SAMPLES, inputFrames);
+      const overlap = Math.floor(grainSize / 2);
+      const synthesisHop = grainSize - overlap;
+      const maxInputStart = inputFrames - grainSize;
+      // 做了最后一个颗粒的输入/输出双端对齐，以防止出现 1024-sample AAC
+      // 小块末尾重复一小段或丢掉尾音的情况。
+      const finalOutputStart = Math.max(0, outputFrames - grainSize);
+      const outputStarts = [];
+      for (let outputStart = 0; outputStart < finalOutputStart; outputStart += synthesisHop) {
+        outputStarts.push(outputStart);
+      }
+      if (outputStarts[outputStarts.length - 1] !== finalOutputStart) {
+        outputStarts.push(finalOutputStart);
+      }
+      const output = planes.map(() => new Float32Array(outputFrames));
+      let previousStart = -1;
+      let previousOutputStart = -1;
+
+      for (const outputStart of outputStarts) {
+        const isFinalGrain = outputStart === finalOutputStart;
+        const desiredStart = isFinalGrain
+          ? maxInputStart
+          : clampNumber(
+            Math.round(outputStart * rate),
+            0,
+            maxInputStart,
+          );
+        let inputStart = desiredStart;
+        let grainOverlap = 0;
+        if (previousStart >= 0 && maxInputStart > 0) {
+          const outputHop = outputStart - previousOutputStart;
+          grainOverlap = Math.max(0, grainSize - outputHop);
+          if (!isFinalGrain) {
+            let minimum = Math.max(
+              previousStart + 1,
+              desiredStart - AUDIO_STRETCH_SEARCH_SAMPLES,
+            );
+            let maximum = Math.min(maxInputStart, desiredStart + AUDIO_STRETCH_SEARCH_SAMPLES);
+            if (minimum > maximum) {
+              minimum = maxInputStart;
+              maximum = maxInputStart;
+            }
+            const referenceStart = previousStart + outputHop;
+            let bestScore = -Infinity;
+            for (let candidate = minimum; candidate <= maximum; candidate++) {
+              let correlation = 0;
+              let referenceEnergy = 0;
+              let candidateEnergy = 0;
+              for (let channel = 0; channel < planes.length; channel++) {
+                const samples = planes[channel];
+                for (let index = 0; index < grainOverlap; index += 2) {
+                  const reference = samples[referenceStart + index];
+                  const sample = samples[candidate + index];
+                  correlation += reference * sample;
+                  referenceEnergy += reference * reference;
+                  candidateEnergy += sample * sample;
+                }
+              }
+              const score = correlation / Math.sqrt(referenceEnergy * candidateEnergy + 1e-12);
+              if (score > bestScore) {
+                bestScore = score;
+                inputStart = candidate;
+              }
+            }
+          }
+        }
+
+        for (let channel = 0; channel < planes.length; channel++) {
+          const input = planes[channel];
+          const destination = output[channel];
+          for (let index = 0; index < grainSize && outputStart + index < outputFrames; index++) {
+            const outputIndex = outputStart + index;
+            const sample = input[inputStart + index];
+            if (previousStart >= 0 && index < grainOverlap) {
+              const mix = (index + 1) / (grainOverlap + 1);
+              destination[outputIndex] = destination[outputIndex] * (1 - mix) + sample * mix;
+            } else {
+              destination[outputIndex] = sample;
+            }
+          }
+        }
+        previousStart = inputStart;
+        previousOutputStart = outputStart;
+      }
+      return output;
+    }
+
+    function makePitchPreservedAudioBuffer(
+      audioContext,
+      planes,
+      sampleRate,
+      playbackRate,
+      outputFrames,
+    ) {
+      const boundedRate = clampNumber(playbackRate, 0.9, 1.1);
+      const stretchedPlanes = stretchAudioPlanes(planes, boundedRate, outputFrames);
+      const frameCount = stretchedPlanes[0]?.length || 1;
+      const buffer = audioContext.createBuffer(stretchedPlanes.length, frameCount, sampleRate);
+      for (let channel = 0; channel < stretchedPlanes.length; channel++) {
+        buffer.copyToChannel(stretchedPlanes[channel], channel);
+      }
+      return buffer;
+    }
+
+    // 变速只在尚未排程的 PCM 边界生效。已有声音继续无缝播放，新速率从
+    // audioScheduleCursor / audioScheduledUntilPtsUs 这同一个物理边界接管；
+    // 不能重新锚到“现在”，否则每次降速都会在两块 AAC 之间插入空洞。
+    function audioRateTransitionAnchor({
+      currentContextTime,
+      audioScheduleCursor,
+      audioScheduledUntilPtsUs,
+      currentTargetUs,
+      fallbackContextTime,
+    }) {
+      if (Number.isFinite(audioScheduledUntilPtsUs)
+        && Number.isFinite(audioScheduleCursor)
+        && audioScheduleCursor > currentContextTime + 0.001) {
+        return {
+          mediaUs: audioScheduledUntilPtsUs,
+          contextTime: audioScheduleCursor,
+        };
+      }
+      return {
+        mediaUs: currentTargetUs,
+        contextTime: Math.max(
+          currentContextTime + AUDIO_SCHEDULE_LEAD_SECONDS,
+          fallbackContextTime,
+        ),
+      };
+    }
+
+    // 将页面的 performance 时钟换算成“真正送到声卡”的 AudioContext 时钟。
+    // getOutputTimestamp 能同时消除 AudioContext 启动偏移与设备输出延迟；旧版
+    // Chromium 则使用 outputLatency/baseLatency 作保守回退。
+    function audioOutputLatencySeconds(audioContext) {
+      return Number.isFinite(audioContext.outputLatency)
+        ? Math.max(0, audioContext.outputLatency)
+        : Number.isFinite(audioContext.baseLatency) ? Math.max(0, audioContext.baseLatency) : 0;
+    }
+
+    function audioContextTimeForPerformance(audioContext, targetPerfMs) {
+      if (audioContext.state === 'running'
+        && typeof audioContext.getOutputTimestamp === 'function') {
+        const stamp = audioContext.getOutputTimestamp();
+        if (Number.isFinite(stamp?.contextTime) && Number.isFinite(stamp?.performanceTime)
+          && stamp.performanceTime > 0) {
+          return stamp.contextTime + (targetPerfMs - stamp.performanceTime) / 1000;
+        }
+      }
+      return audioContext.currentTime
+        + (targetPerfMs - performance.now()) / 1000
+        - audioOutputLatencySeconds(audioContext);
+    }
+
+    function audioScheduleRecoveryReason({
+      anchored,
+      currentTime,
+      scheduleCursor,
+      sourceCount,
+      maximumAheadSeconds,
+    }) {
+      if (!anchored) return null;
+      if (!Number.isFinite(currentTime) || !Number.isFinite(scheduleCursor)
+        || !Number.isFinite(maximumAheadSeconds) || maximumAheadSeconds < 0) {
+        return 'invalid-timing';
+      }
+      if (scheduleCursor > currentTime + maximumAheadSeconds) return 'future-backlog';
+      if (sourceCount >= MAX_AUDIO_SOURCES) return 'source-limit';
+      return null;
+    }
+
+    function audioDecoderRecoveryReason({
+      decoderReady,
+      clockReady,
+      inputAgeMs,
+      outputAgeMs,
+      bufferedSeconds,
+      graceRemainingMs,
+      recoveryAgeMs,
+      stallThresholdMs,
+      inputActiveWindowMs,
+      recoveryBufferSeconds,
+    }) {
+      if (!decoderReady || !clockReady) return null;
+      if (![inputAgeMs, outputAgeMs, bufferedSeconds, graceRemainingMs,
+        recoveryAgeMs, stallThresholdMs, inputActiveWindowMs,
+        recoveryBufferSeconds].every(Number.isFinite)) {
+        return null;
+      }
+      if (inputAgeMs > inputActiveWindowMs || graceRemainingMs > 0) return null;
+      if (recoveryAgeMs < AUDIO_DECODER_RECOVERY_COOLDOWN_MS) return null;
+      if (outputAgeMs < stallThresholdMs || bufferedSeconds > recoveryBufferSeconds) return null;
+      // decodeQueueSize 可能已经回到 0：Chromium 有时会消费 EncodedAudioChunk
+      // 却不触发 output 回调，因此不能再用队列非空作为停滞的必要条件。
+      return 'output-stalled';
+    }
+
+    // AudioDecoder 的输出一旦交给回调就不能留存；因此只有在音频上下文和
+    // 视频时间轴都可用时才开始解码。否则把压缩 AAC 暂存在 audioInput，等待
+    // 用户解锁声音或关键帧建立时钟后再调度，避免“解出来马上丢掉”造成无声。
+    function audioClockIsReady(audioContext, mediaBaseUs, startPerfMs) {
+      return Boolean(audioContext
+        && audioContext.state === 'running'
+        && mediaBaseUs !== null
+        && startPerfMs !== null);
+    }
+
+    // 恢复音频时只解码仍可能赶上当前媒体时钟的 AAC 帧。这样既不把解锁期间
+    // 的旧声音积成额外延迟，也不需要重建解码器并丢掉刚到达的最新数据。
+    function retainSchedulableAudioInput(audioInput, currentTargetUs) {
+      if (!Number.isFinite(currentTargetUs) || !audioInput.length) return audioInput;
+      const earliestUs = currentTargetUs - MAX_AUDIO_LATE_SCHEDULE_SECONDS * 1000000;
+      let first = 0;
+      while (first < audioInput.length && audioInput[first].timestampUs < earliestUs) first++;
+      return first === 0 ? audioInput : audioInput.slice(first);
+    }
+
     function decodeStreamPath(value) {
       try { return decodeURIComponent(value); } catch (_) { return value; }
+    }
+
+    function cadenceAtOrBelow(maximumFps, capacityFps) {
+      const maximum = clampNumber(maximumFps, MIN_TARGET_VIDEO_FPS, MAX_TARGET_VIDEO_FPS);
+      const capacity = clampNumber(capacityFps, MIN_TARGET_VIDEO_FPS, maximum);
+      const divisor = Math.max(1, Math.ceil(
+        maximum / (capacity + FRAME_RATE_EPSILON_FPS),
+      ));
+      return Math.max(MIN_TARGET_VIDEO_FPS, maximum / divisor);
+    }
+
+    function nextHigherCadence(maximumFps, currentFps) {
+      const maximum = clampNumber(maximumFps, MIN_TARGET_VIDEO_FPS, MAX_TARGET_VIDEO_FPS);
+      if (currentFps >= maximum - FRAME_RATE_EPSILON_FPS) return maximum;
+      const divisor = Math.max(2, Math.round(maximum / Math.max(1, currentFps)));
+      return maximum / (divisor - 1);
+    }
+
+    function advanceVideoPresentationDeadline(deadlineMs, nowMs, targetFps) {
+      const intervalMs = 1000 / Math.max(1, targetFps);
+      if (!Number.isFinite(deadlineMs)) return nowMs + intervalMs;
+      const missedIntervals = Math.max(
+        1,
+        Math.floor(
+          (nowMs + VIDEO_PRESENTATION_EPSILON_MS - deadlineMs) / intervalMs,
+        ) + 1,
+      );
+      return deadlineMs + missedIntervals * intervalMs;
+    }
+
+    // 将“源流供给不足”和“本地展示性能不足”分开判断。降档只选显示上限的
+    // 整数分频（例如 60 -> 30 -> 20），让丢帧均匀分布，避免 54fps 之类目标
+    // 在 60Hz rAF 上形成周期性的短-短-长帧。
+    function evaluateFrameRateControl({
+      targetVideoFps,
+      preferredVideoFps,
+      rafFps,
+      presentationRatio,
+      longRafRatio,
+      sourceLimited,
+      stableSamples,
+      limitedSamples,
+      recoveryCooldownSamples,
+      recoveryBackoffSamples,
+      recoveryProbeSamples,
+    }) {
+      const target = clampNumber(
+        Number.isFinite(targetVideoFps) ? targetVideoFps : INITIAL_TARGET_VIDEO_FPS,
+        MIN_TARGET_VIDEO_FPS,
+        MAX_TARGET_VIDEO_FPS,
+      );
+      const preferred = clampNumber(
+        Number.isFinite(preferredVideoFps) ? preferredVideoFps : INITIAL_TARGET_VIDEO_FPS,
+        MIN_TARGET_VIDEO_FPS,
+        MAX_TARGET_VIDEO_FPS,
+      );
+      const measuredRafFps = Number.isFinite(rafFps) && rafFps > 0 ? rafFps : preferred;
+      const displayCapacityLimited = target
+        > measuredRafFps + FRAME_RATE_RAF_TOLERANCE_FPS;
+      const roundedRafCapacity = Math.max(
+        MIN_TARGET_VIDEO_FPS,
+        Math.round(measuredRafFps + (displayCapacityLimited ? 0 : 0.5)),
+      );
+      const maximumFps = Math.min(
+        preferred,
+        displayCapacityLimited
+          ? roundedRafCapacity
+          : Math.max(target, roundedRafCapacity),
+      );
+      const stable = clampNumber(
+        Math.floor(Number.isFinite(stableSamples) ? stableSamples : 0),
+        0,
+        STABLE_SAMPLES_BEFORE_INCREASE,
+      );
+      const limited = clampNumber(
+        Math.floor(Number.isFinite(limitedSamples) ? limitedSamples : 0),
+        0,
+        FRAME_RATE_LIMITED_SAMPLES_BEFORE_DECREASE,
+      );
+      const recoveryCooldown = clampNumber(
+        Math.floor(Number.isFinite(recoveryCooldownSamples) ? recoveryCooldownSamples : 0),
+        0,
+        FRAME_RATE_RECOVERY_BACKOFF_MAX_SAMPLES,
+      );
+      const recoveryBackoff = clampNumber(
+        Math.floor(Number.isFinite(recoveryBackoffSamples) ? recoveryBackoffSamples : 0),
+        0,
+        FRAME_RATE_RECOVERY_BACKOFF_MAX_SAMPLES,
+      );
+      const recoveryProbe = clampNumber(
+        Math.floor(Number.isFinite(recoveryProbeSamples) ? recoveryProbeSamples : 0),
+        0,
+        FRAME_RATE_RECOVERY_PROBE_SUCCESS_SAMPLES,
+      );
+      // decodeQueueSize 的正常高水位不代表降低 canvas 呈现频率能缓解压力：
+      // H.264 参考帧仍必须全部解码。这里只依据真实的 rAF/呈现缺口降档，
+      // 避免解码泵长期保持 7–8 个任务时把目标帧率永久锁死。
+      const localPerformanceLimited = displayCapacityLimited
+        || longRafRatio > 1 - REQUIRED_PRESENTATION_RATIO
+        || (sourceLimited !== true && presentationRatio < REQUIRED_PRESENTATION_RATIO);
+
+      if (localPerformanceLimited) {
+        const nextLimitedSamples = Math.min(
+          FRAME_RATE_LIMITED_SAMPLES_BEFORE_DECREASE,
+          limited + 1,
+        );
+        if (nextLimitedSamples < FRAME_RATE_LIMITED_SAMPLES_BEFORE_DECREASE) {
+          return {
+            targetVideoFps: target,
+            // 单个大帧、GC 或合成抖动只扣除一次恢复信用，不把此前连续
+            // 健康窗口全部清零。只有压力连续存在并真正降档时才重新计时。
+            stableSamples: Math.max(0, stable - 1),
+            limitedSamples: nextLimitedSamples,
+            recoveryCooldownSamples: recoveryCooldown,
+            recoveryBackoffSamples: recoveryBackoff,
+            recoveryProbeSamples: recoveryProbe,
+            maximumFps,
+            reason: displayCapacityLimited
+              ? 'display-capacity-pending'
+              : 'local-performance-pending',
+          };
+        }
+        const measuredCapacity = displayCapacityLimited
+          ? maximumFps
+          : target * clampNumber(presentationRatio, 0.5, REQUIRED_PRESENTATION_RATIO);
+        const nextTarget = cadenceAtOrBelow(
+          Math.max(target, maximumFps),
+          Math.min(maximumFps, measuredCapacity),
+        );
+        const failedRecoveryProbe = recoveryProbe > 0
+          && nextTarget + FRAME_RATE_EPSILON_FPS < target;
+        const nextRecoveryBackoff = failedRecoveryProbe
+          ? Math.min(
+            FRAME_RATE_RECOVERY_BACKOFF_MAX_SAMPLES,
+            recoveryBackoff > 0
+              ? recoveryBackoff * 2
+              : FRAME_RATE_RECOVERY_BACKOFF_BASE_SAMPLES,
+          )
+          : recoveryBackoff;
+        return {
+          targetVideoFps: nextTarget,
+          stableSamples: 0,
+          limitedSamples: 0,
+          recoveryCooldownSamples: failedRecoveryProbe
+            ? nextRecoveryBackoff
+            : nextTarget + FRAME_RATE_EPSILON_FPS < target
+              ? recoveryBackoff
+              : recoveryCooldown,
+          recoveryBackoffSamples: nextRecoveryBackoff,
+          recoveryProbeSamples: 0,
+          maximumFps,
+          reason: displayCapacityLimited ? 'display-capacity' : 'local-performance',
+        };
+      }
+
+      if (sourceLimited === true) {
+        return {
+          targetVideoFps: target,
+          // 源供给不足既不能证明本地仍有余量，也不能证明本地能力变差；
+          // 暂停恢复进度，等源回来后从原信用继续，而不是永久锁在低档。
+          stableSamples: stable,
+          limitedSamples: 0,
+          recoveryCooldownSamples: recoveryCooldown,
+          recoveryBackoffSamples: recoveryBackoff,
+          recoveryProbeSamples: recoveryProbe,
+          maximumFps,
+          reason: 'source-limited',
+        };
+      }
+
+      if (recoveryCooldown > 0) {
+        return {
+          targetVideoFps: target,
+          stableSamples: stable,
+          limitedSamples: 0,
+          recoveryCooldownSamples: recoveryCooldown - 1,
+          recoveryBackoffSamples: recoveryBackoff,
+          recoveryProbeSamples: recoveryProbe,
+          maximumFps,
+          reason: 'recovery-cooldown',
+        };
+      }
+
+      let nextRecoveryProbe = recoveryProbe;
+      let nextRecoveryBackoff = recoveryBackoff;
+      if (nextRecoveryProbe > 0) {
+        nextRecoveryProbe++;
+        if (nextRecoveryProbe >= FRAME_RATE_RECOVERY_PROBE_SUCCESS_SAMPLES) {
+          nextRecoveryProbe = 0;
+          nextRecoveryBackoff = 0;
+        }
+      }
+      const canRecover = target + FRAME_RATE_EPSILON_FPS < maximumFps;
+      const nextStableSamples = canRecover
+        ? Math.min(STABLE_SAMPLES_BEFORE_INCREASE, stable + 1)
+        : 0;
+      if (nextStableSamples >= STABLE_SAMPLES_BEFORE_INCREASE
+        && canRecover) {
+        return {
+          targetVideoFps: nextHigherCadence(maximumFps, target),
+          stableSamples: 0,
+          limitedSamples: 0,
+          recoveryCooldownSamples: 0,
+          recoveryBackoffSamples: nextRecoveryBackoff,
+          recoveryProbeSamples: 1,
+          maximumFps,
+          reason: 'recover',
+        };
+      }
+
+      return {
+        targetVideoFps: target,
+        stableSamples: nextStableSamples,
+        limitedSamples: 0,
+        recoveryCooldownSamples: 0,
+        recoveryBackoffSamples: nextRecoveryBackoff,
+        recoveryProbeSamples: nextRecoveryProbe,
+        maximumFps,
+        reason: 'steady',
+      };
+    }
+
+    function measureSourceVideoRate(frameCount, elapsedSeconds, firstPtsUs, lastPtsUs) {
+      const sourceArrivalFps = frameCount / Math.max(0.001, elapsedSeconds);
+      const sourcePtsElapsedUs = firstPtsUs !== null && lastPtsUs !== null
+        ? lastPtsUs - firstPtsUs
+        : 0;
+      const sourcePtsFps = frameCount > 1 && sourcePtsElapsedUs > 0
+        ? (frameCount - 1) * 1000000 / sourcePtsElapsedUs
+        : 0;
+      // 网络恢复时可能把已缓存的帧集中送来：到达率会瞬时偏高，但 PTS
+      // 速率仍代表源的真实节奏。因此两者取小值，避免把突发误当作高帧率源。
+      return {
+        sourceArrivalFps,
+        sourcePtsFps,
+        measuredSourceFps: sourcePtsFps > 0
+          ? Math.min(sourceArrivalFps, sourcePtsFps)
+          : sourceArrivalFps,
+      };
+    }
+
+    function evaluateSourceAvailability({
+      targetVideoFps,
+      sourceNominalVideoFps,
+      sourceArrivalFps,
+      sourcePtsFps,
+    }) {
+      const expectedFps = sourceNominalVideoFps > 0
+        ? Math.min(targetVideoFps, sourceNominalVideoFps)
+        : targetVideoFps;
+      const sourceLimited = sourceNominalVideoFps > 0
+        && (sourceArrivalFps < expectedFps * SOURCE_RATE_SHORTFALL_RATIO
+          || (sourcePtsFps > 0 && sourcePtsFps < expectedFps * SOURCE_RATE_SHORTFALL_RATIO));
+      return { expectedFps, sourceLimited };
     }
 
     // ============ 单流播放会话 ============
@@ -256,6 +799,8 @@
         this.abortController = null;
         this.loopPromise = null;
         this.flvHeaderRead = false;
+        this.lastFlvTimestampMs = null;
+        this.flvTimestampWrapOffsetMs = 0;
         this.videoConfig = null;
         this.videoConfigKey = '';
         this.videoDecoder = null;
@@ -276,40 +821,76 @@
         // 自适应展示帧率只决定“哪些已解码画面送到 canvas”。H.264 预测帧
         // 仍按完整顺序交给解码器，不能在编码输入侧任意抽掉，否则会破坏参考帧。
         this.targetVideoFps = INITIAL_TARGET_VIDEO_FPS;
+        // preferred 是“正常情况下应恢复到的展示上限”，不会因源流暂时掉帧
+        // 而下调；target 才是依据本地展示性能临时探测出来的当前上限。
+        this.preferredVideoFps = INITIAL_TARGET_VIDEO_FPS;
         this.sourceVideoFps = 0;
-        this.sourceRateWindowStartPtsUs = null;
-        this.sourceRateWindowFrames = 0;
-        this.lastSourceRatePtsUs = null;
-        this.nextVideoOutputPtsUs = null;
+        this.sourceNominalVideoFps = 0;
+        this.sourceRateLowSinceMs = null;
         this.sampledVideoFrames = 0;
+        this.nextVideoPresentationMs = null;
+        this.lastVideoPresentationMs = null;
         this.frameRateWindowStartMs = performance.now();
         this.frameRateWindowRafCount = 0;
         this.frameRateWindowLongRafCount = 0;
         this.lastRenderCallbackMs = null;
         this.frameRateWindowRenderedFrames = 0;
+        this.frameRateWindowPresentationIntervals = 0;
+        this.frameRateWindowPresentationIntervalSumMs = 0;
+        this.frameRateWindowPresentationIntervalSquareSumMs = 0;
+        this.frameRateWindowSourceFrames = 0;
+        this.frameRateWindowSourceFirstPtsUs = null;
+        this.frameRateWindowSourceLastPtsUs = null;
         this.frameRateStableSamples = 0;
-        this.frameRateProbeStarted = false;
+        this.frameRateLimitedSamples = 0;
+        this.frameRateRecoveryCooldownSamples = 0;
+        this.frameRateRecoveryBackoffSamples = 0;
+        this.frameRateRecoveryProbeSamples = 0;
         this.lastMeasuredRafFps = 0;
         this.lastMeasuredPresentationFps = 0;
+        this.lastPresentationIntervalVarianceMs2 = 0;
+        this.lastPresentationIntervalStdDevMs = 0;
         this.lastPresentationRatio = 1;
         this.lastLongRafRatio = 0;
+        this.lastMeasuredSourceFps = 0;
+        this.lastMeasuredSourceArrivalFps = 0;
+        this.lastMeasuredSourcePtsFps = 0;
+        this.lastSourceLimited = false;
+        this.lastSourceRecovering = false;
         this.lastFrameRateBacklogged = false;
         this.audioContext = null;
         this.audioConfig = null;
         this.audioConfigKey = '';
         this.audioDecoder = null;
+        this.audioDecoderGeneration = 0;
         this.audioInput = [];
         this.audioSources = new Set();
-        this.audioBaseContextTime = null;
+        this.audioAnchorMediaUs = null;
+        this.audioAnchorContextTime = null;
         this.audioScheduleCursor = 0;
+        this.audioScheduledUntilPtsUs = null;
+        this.audioScheduleRate = 1;
+        this.audioStretchFrameRemainder = 0;
         this.lastAudioPtsUs = null;
+        this.lastAudioOutputAt = performance.now();
+        this.lastAudioInputAt = 0;
+        this.audioDecoderGraceUntil = 0;
+        this.audioDecoderRecoveries = 0;
+        this.lastAudioDecoderRecoveryAt = 0;
+        this.lastAudioDecoderRecoveryReason = '';
+        this.audioContextResumeAttempts = 0;
+        this.lastAudioContextResumeAttemptAt = 0;
+        this.audioScheduleRecoveries = 0;
+        this.audioScheduleErrors = 0;
+        this.lastAudioScheduleRecoveryReason = '';
+        this.lastAudioScheduleRecoveryAt = 0;
+        this.lastAudioScheduleError = '';
+        this.lastAudioScheduleErrorAt = 0;
+        this.lastAudioRecoveryStatusAt = 0;
         this.playbackRate = 1;
         this.feedbackInFlight = false;
-        this.recycling = false;
-        this.degradedSamples = 0;
-        this.recycleTimer = setInterval(() => {
-          this.recyclePipeline('periodic');
-        }, PIPELINE_RECYCLE_INTERVAL_MS);
+        this.videoDegradedSamples = 0;
+        this.videoPipelineRecoveries = 0;
       }
 
       setFatal(message) {
@@ -326,7 +907,6 @@
         this.videoDecoder = null;
         this.videoInput = [];
         this.videoInputBytes = 0;
-        this.nextVideoOutputPtsUs = null;
         for (const frame of this.videoFrames) {
           try { frame.close(); } catch (_) {}
         }
@@ -334,27 +914,41 @@
         this.lastVideoOutputAt = performance.now();
       }
 
-      closeAudioDecoder() {
+      closeAudioDecoderInstance(clearInput = true) {
+        this.audioDecoderGeneration++;
         if (this.audioDecoder) {
           try { this.audioDecoder.close(); } catch (_) {}
         }
+        this.audioDecoder = null;
+        if (clearInput) this.audioInput = [];
+        this.lastAudioOutputAt = performance.now();
+      }
+
+      closeAudioDecoder() {
+        this.closeAudioDecoderInstance();
         for (const entry of this.audioSources) {
           entry.source.onended = null;
           try { entry.source.stop(); } catch (_) {}
           try { entry.source.disconnect(); } catch (_) {}
         }
         this.audioSources.clear();
-        this.audioDecoder = null;
-        this.audioInput = [];
-        this.audioBaseContextTime = null;
+        this.audioAnchorMediaUs = null;
+        this.audioAnchorContextTime = null;
         this.audioScheduleCursor = 0;
+        this.audioScheduledUntilPtsUs = null;
+        this.audioScheduleRate = this.playbackRate;
+        this.audioStretchFrameRemainder = 0;
         this.lastAudioPtsUs = null;
+        this.lastAudioInputAt = 0;
+        this.audioDecoderGraceUntil = 0;
       }
 
       resetPipeline() {
         this.closeVideoDecoder();
         this.closeAudioDecoder();
         this.flvHeaderRead = false;
+        this.lastFlvTimestampMs = null;
+        this.flvTimestampWrapOffsetMs = 0;
         this.networkBufferBytes = 0;
         this.videoConfig = null;
         this.videoConfigKey = '';
@@ -365,6 +959,13 @@
         this.startPerfMs = null;
         this.lastInputPtsUs = null;
         this.lastDisplayedPtsUs = null;
+        this.nextVideoPresentationMs = null;
+        this.lastVideoPresentationMs = null;
+        this.frameRateStableSamples = 0;
+        this.frameRateLimitedSamples = 0;
+        this.frameRateRecoveryCooldownSamples = 0;
+        this.frameRateRecoveryBackoffSamples = 0;
+        this.frameRateRecoveryProbeSamples = 0;
         if (this.context) this.context.clearRect(0, 0, this.canvas.width, this.canvas.height);
       }
 
@@ -410,7 +1011,70 @@
         if (videoConfig) this.configureVideo(videoConfig);
       }
 
-      // 速率变化时保持当前媒体位置连续,只改变后续播放时间的斜率。
+      audioDecoderStallThresholdMs() {
+        const sampleRate = Number(this.audioConfig?.sampleRate);
+        const fourAacFramesMs = Number.isFinite(sampleRate) && sampleRate > 0
+          ? 4 * 1024 / sampleRate * 1000
+          : MIN_AUDIO_DECODER_STALL_MS;
+        return clampNumber(
+          fourAacFramesMs,
+          MIN_AUDIO_DECODER_STALL_MS,
+          MAX_AUDIO_DECODER_STALL_MS,
+        );
+      }
+
+      audioBufferedSeconds() {
+        if (!this.audioContext) return 0;
+        return Math.max(0, this.audioScheduleCursor - this.audioContext.currentTime);
+      }
+
+      ensureAudioContextRunning(nowPerfMs = performance.now()) {
+        const context = this.audioContext;
+        if (!context || context.state === 'running' || context.state === 'closed') return;
+        if (this.lastAudioContextResumeAttemptAt > 0
+          && nowPerfMs - this.lastAudioContextResumeAttemptAt < AUDIO_CONTEXT_RESUME_RETRY_MS) return;
+        this.lastAudioContextResumeAttemptAt = nowPerfMs;
+        this.audioContextResumeAttempts++;
+        context.resume().catch(() => {});
+      }
+
+      recoverStalledAudioDecoder(nowPerfMs = performance.now()) {
+        const stallThresholdMs = this.audioDecoderStallThresholdMs();
+        const reason = audioDecoderRecoveryReason({
+          decoderReady: Boolean(this.audioDecoder),
+          clockReady: audioClockIsReady(this.audioContext, this.mediaBaseUs, this.startPerfMs),
+          inputAgeMs: this.lastAudioInputAt > 0
+            ? nowPerfMs - this.lastAudioInputAt
+            : Number.MAX_SAFE_INTEGER,
+          outputAgeMs: nowPerfMs - this.lastAudioOutputAt,
+          bufferedSeconds: this.audioBufferedSeconds(),
+          graceRemainingMs: Math.max(0, this.audioDecoderGraceUntil - nowPerfMs),
+          recoveryAgeMs: this.lastAudioDecoderRecoveryAt > 0
+            ? nowPerfMs - this.lastAudioDecoderRecoveryAt
+            : Number.MAX_SAFE_INTEGER,
+          stallThresholdMs,
+          inputActiveWindowMs: Math.max(AUDIO_INPUT_ACTIVE_WINDOW_MS, stallThresholdMs * 3),
+          recoveryBufferSeconds: stallThresholdMs / 1000 + 0.03,
+        });
+        if (!reason) return null;
+
+        // 只替换停滞的 decoder 实例，保留已经交给声卡的节点和连续排程锚点。
+        // 判定不再依赖 decodeQueueSize/audioInput：两者都可能已被一个不输出
+        // 回调的 decoder 消耗为 0。
+        setStatus('音频解码输出停滞，正在快速无缝重建…', true);
+        this.audioDecoderRecoveries++;
+        this.lastAudioDecoderRecoveryAt = nowPerfMs;
+        this.lastAudioDecoderRecoveryReason = reason;
+        this.closeAudioDecoderInstance(false);
+        this.audioInput = retainSchedulableAudioInput(this.audioInput, this.currentTargetUs());
+        this.audioDecoderGraceUntil = nowPerfMs + stallThresholdMs;
+        this.configureAudio();
+        this.pumpAudio();
+        return reason;
+      }
+
+      // 做了速率变化时的媒体位置连续重锚定，以防止出现切换控速瞬间跳帧或
+      // 跳音的情况。后续 PCM 块会先经过 WSOLA 时间伸缩，再以节点 1x 播放。
       setPlaybackRate(rate) {
         const next = Number.isFinite(rate) ? Math.min(1.1, Math.max(0.9, rate)) : 1;
         if (Math.abs(next - this.playbackRate) < 0.001) return;
@@ -421,37 +1085,37 @@
           this.startPerfMs = now
             - (currentTarget - this.mediaBaseUs) / (next * 1000);
         }
-        if (this.audioContext && this.audioBaseContextTime !== null
-          && this.mediaBaseUs !== null) {
-          this.audioBaseContextTime = this.audioContext.currentTime
-            - (currentTarget - this.mediaBaseUs) / 1000000 / next;
-        }
-        this.updateAudioPlaybackRate(next);
+        this.transitionAudioScheduleRate(next, currentTarget, now);
       }
 
-      updateAudioPlaybackRate(next) {
-        if (!this.audioContext) return;
-        const now = this.audioContext.currentTime;
-        let latestEnd = now + 0.02;
-        for (const entry of this.audioSources) {
-          const oldRate = entry.rate;
-          const elapsed = Math.max(0, now - entry.startAt);
-          const consumed = Math.min(entry.duration, elapsed * oldRate);
-          try { entry.source.playbackRate.setValueAtTime(next, now); } catch (_) {}
-          entry.rate = next;
-          entry.endAt = entry.startAt > now
-            ? entry.startAt + entry.duration / next
-            : now + Math.max(0, entry.duration - consumed) / next;
-          latestEnd = Math.max(latestEnd, entry.endAt);
-        }
-        this.audioScheduleCursor = latestEnd;
+      transitionAudioScheduleRate(next, currentTargetUs, nowPerfMs = performance.now()) {
+        this.audioScheduleRate = next;
+        if (!this.audioContext || this.mediaBaseUs === null) return;
+        const fallbackContextTime = audioContextTimeForPerformance(
+          this.audioContext,
+          nowPerfMs + EXTRA_AUDIO_LATENT_MS,
+        );
+        const anchor = audioRateTransitionAnchor({
+          currentContextTime: this.audioContext.currentTime,
+          audioScheduleCursor: this.audioScheduleCursor,
+          audioScheduledUntilPtsUs: this.audioScheduledUntilPtsUs,
+          currentTargetUs,
+          fallbackContextTime,
+        });
+        this.audioAnchorMediaUs = anchor.mediaUs;
+        this.audioAnchorContextTime = anchor.contextTime;
+        this.audioScheduleCursor = Math.max(this.audioScheduleCursor, anchor.contextTime);
+        this.audioScheduledUntilPtsUs = anchor.mediaUs;
       }
 
       pruneAudioSources() {
         if (!this.audioContext) return;
         const now = this.audioContext.currentTime;
-        for (const entry of this.audioSources) {
-          if (entry.endAt <= now) this.releaseAudioEntry(entry);
+        for (const entry of [...this.audioSources]) {
+          if (!Number.isFinite(entry.startAt) || !Number.isFinite(entry.endAt)
+            || entry.endAt <= now) {
+            this.releaseAudioEntry(entry);
+          }
         }
       }
 
@@ -460,6 +1124,42 @@
         try { entry.source.stop(); } catch (_) {}
         try { entry.source.disconnect(); } catch (_) {}
         this.audioSources.delete(entry);
+      }
+
+      maximumAudioScheduleAheadSeconds() {
+        return Math.max(
+          2,
+          playbackLatencyMs() / 1000 + EXTRA_AUDIO_LATENT_MS / 1000 + 2,
+        );
+      }
+
+      recoverAudioSchedule(reason, nowPerfMs = performance.now()) {
+        if (!this.audioContext) return;
+        this.audioScheduleRecoveries++;
+        this.lastAudioScheduleRecoveryReason = reason;
+        this.lastAudioScheduleRecoveryAt = nowPerfMs;
+        if (this.lastAudioRecoveryStatusAt === 0
+          || nowPerfMs - this.lastAudioRecoveryStatusAt >= AUDIO_RECOVERY_STATUS_INTERVAL_MS) {
+          setStatus('音频调度正在局部重新对齐…', true);
+          this.lastAudioRecoveryStatusAt = nowPerfMs;
+        }
+        // 只重排未来 PCM 节点；不关闭 AudioDecoder、不重连 FLV，也不触碰
+        // 视频时间轴。这样单次音频时钟异常不会扩大成一个 GOP 长度的静音。
+        this.realignAudioSchedule(this.currentTargetUs(nowPerfMs), nowPerfMs);
+      }
+
+      recoverAudioScheduleHealth(nowPerfMs = performance.now()) {
+        if (!audioClockIsReady(this.audioContext, this.mediaBaseUs, this.startPerfMs)) return null;
+        this.pruneAudioSources();
+        const reason = audioScheduleRecoveryReason({
+          anchored: this.audioAnchorMediaUs !== null && this.audioAnchorContextTime !== null,
+          currentTime: this.audioContext.currentTime,
+          scheduleCursor: this.audioScheduleCursor,
+          sourceCount: this.audioSources.size,
+          maximumAheadSeconds: this.maximumAudioScheduleAheadSeconds(),
+        });
+        if (reason) this.recoverAudioSchedule(reason, nowPerfMs);
+        return reason;
       }
 
       // 视频时间轴始终使用 performance.now。AudioContext 仅用于安排声音，
@@ -473,83 +1173,67 @@
       }
 
       observeSourceVideoRate(timestampUs) {
+        this.frameRateWindowSourceFrames++;
         if (!Number.isFinite(timestampUs)) return;
-        if (this.lastSourceRatePtsUs === null
-          || timestampUs <= this.lastSourceRatePtsUs
-          || timestampUs - this.lastSourceRatePtsUs > 1000000) {
-          this.sourceRateWindowStartPtsUs = timestampUs;
-          this.sourceRateWindowFrames = 0;
-          this.lastSourceRatePtsUs = timestampUs;
+        if (this.frameRateWindowSourceFirstPtsUs === null) {
+          this.frameRateWindowSourceFirstPtsUs = timestampUs;
+          this.frameRateWindowSourceLastPtsUs = timestampUs;
           return;
         }
-        this.lastSourceRatePtsUs = timestampUs;
-        this.sourceRateWindowFrames++;
-        const windowStartUs = this.sourceRateWindowStartPtsUs;
-        if (windowStartUs === null) {
-          this.sourceRateWindowStartPtsUs = timestampUs;
-          this.sourceRateWindowFrames = 0;
-          return;
+        // B 帧或重连可能带来回退 PTS；它们不应把这一小段统计窗口的源速率
+        // 误判为 0，只使用窗口中的最大 PTS 来估算媒体时间跨度。
+        if (this.frameRateWindowSourceLastPtsUs === null
+          || timestampUs >= this.frameRateWindowSourceLastPtsUs) {
+          this.frameRateWindowSourceLastPtsUs = timestampUs;
         }
-        const elapsedUs = timestampUs - windowStartUs;
-        if (elapsedUs < 1000000) return;
-        const measuredFps = this.sourceRateWindowFrames * 1000000 / elapsedUs;
-        if (Number.isFinite(measuredFps) && measuredFps > 0) {
-          this.sourceVideoFps = this.sourceVideoFps > 0
-            ? this.sourceVideoFps * 0.7 + measuredFps * 0.3
-            : measuredFps;
-          // 起播后先以源帧率作为探测上限。若浏览器达不到 95% 的展示率，
-          // observeFrameRate 会每秒小步下调 targetVideoFps；若源本身低于
-          // 默认值，则由同一控制器平滑降到源帧率，避免切换时突兀跳变。
-          if (!this.frameRateProbeStarted) {
-            this.frameRateProbeStarted = true;
-            if (this.sourceVideoFps > this.targetVideoFps + 0.25) {
-              this.setTargetVideoFps(this.sourceVideoFps);
-            }
+      }
+
+      updateSourceVideoRate(measuredFps, now) {
+        if (!Number.isFinite(measuredFps) || measuredFps <= 0) return;
+        const boundedFps = Math.min(MAX_TARGET_VIDEO_FPS, measuredFps);
+        this.sourceVideoFps = boundedFps;
+        if (this.sourceNominalVideoFps <= 0) {
+          this.sourceNominalVideoFps = boundedFps;
+          this.sourceRateLowSinceMs = null;
+        } else if (boundedFps >= this.sourceNominalVideoFps * SOURCE_RATE_SHORTFALL_RATIO) {
+          this.sourceRateLowSinceMs = null;
+          if (boundedFps > this.sourceNominalVideoFps + FRAME_RATE_EPSILON_FPS) {
+            this.sourceNominalVideoFps = boundedFps;
           }
+        } else if (this.sourceRateLowSinceMs === null) {
+          this.sourceRateLowSinceMs = now;
+        } else if (now - this.sourceRateLowSinceMs >= SOURCE_RATE_SETTLE_MS) {
+          // 连续低速才更新基线：永久改成低帧率的流能被正确衡量，而短暂
+          // 网络抖动不会把后续恢复帧率锁死在较低目标上。
+          this.sourceNominalVideoFps = boundedFps;
+          this.sourceRateLowSinceMs = null;
         }
-        this.sourceRateWindowStartPtsUs = timestampUs;
-        this.sourceRateWindowFrames = 0;
+
+        if (this.sourceNominalVideoFps > this.preferredVideoFps + FRAME_RATE_EPSILON_FPS) {
+          this.preferredVideoFps = Math.min(MAX_TARGET_VIDEO_FPS, this.sourceNominalVideoFps);
+        }
       }
 
       setTargetVideoFps(value) {
-        const sourceFloor = this.sourceVideoFps > 0
-          ? Math.min(MIN_TARGET_VIDEO_FPS, this.sourceVideoFps)
-          : MIN_TARGET_VIDEO_FPS;
-        const bounded = Math.min(
+        const bounded = clampNumber(
+          Number.isFinite(value) ? value : INITIAL_TARGET_VIDEO_FPS,
+          MIN_TARGET_VIDEO_FPS,
           MAX_TARGET_VIDEO_FPS,
-          Math.max(sourceFloor, Number.isFinite(value) ? value : INITIAL_TARGET_VIDEO_FPS),
         );
         const next = Math.round(bounded * 10) / 10;
         if (Math.abs(next - this.targetVideoFps) < 0.25) return;
         this.targetVideoFps = next;
-        // 新的抽帧间隔从下一张解码图像重新对齐，避免旧相位导致一段时间内
-        // 连续跳过或连续保留多张帧。
-        this.nextVideoOutputPtsUs = null;
+        // 保留上一张真正呈现帧的相位，只改变下一截止时间。这样降档和恢复
+        // 都不会在切换瞬间连续画两张或额外空一拍。
+        this.nextVideoPresentationMs = this.lastVideoPresentationMs === null
+          ? null
+          : this.lastVideoPresentationMs + 1000 / this.targetVideoFps;
         this.trimVideoOutput();
       }
 
-      videoOutputIntervalUs() {
-        return 1000000 / Math.max(1, this.targetVideoFps);
-      }
-
-      shouldQueueDecodedVideoFrame(timestampUs) {
-        if (!Number.isFinite(timestampUs)) return true;
-        const intervalUs = this.videoOutputIntervalUs();
-        if (this.nextVideoOutputPtsUs === null) {
-          this.nextVideoOutputPtsUs = timestampUs + intervalUs;
-          return true;
-        }
-        if (timestampUs < this.nextVideoOutputPtsUs) return false;
-        // 网络恢复后时间戳可能一次跨过多帧；直接从当前帧开始新的采样相位，
-        // 不让循环按数秒历史逐个补齐。
-        if (timestampUs - this.nextVideoOutputPtsUs > intervalUs * 4) {
-          this.nextVideoOutputPtsUs = timestampUs + intervalUs;
-          return true;
-        }
-        do {
-          this.nextVideoOutputPtsUs += intervalUs;
-        } while (this.nextVideoOutputPtsUs <= timestampUs);
-        return true;
+      videoPresentationIsDue(now) {
+        return this.nextVideoPresentationMs === null
+          || now + VIDEO_PRESENTATION_EPSILON_MS >= this.nextVideoPresentationMs;
       }
 
       trimVideoOutput() {
@@ -570,13 +1254,27 @@
       }
 
       queueDecodedVideoFrame(frame) {
+        // 不在解码回调里按浮点 PTS 阈值抽帧。FLV 的毫秒时间戳会让 60fps
+        // 呈 16/17ms 交替，旧算法会误产出 16/33ms 的 40fps 锯齿。所有短窗
+        // 输出交给 rAF 截止时间统一选择，超期帧只在同一次呈现中均匀丢弃。
         const timestampUs = Number(frame.timestamp);
-        if (!this.shouldQueueDecodedVideoFrame(timestampUs)) {
+        if (this.lastDisplayedPtsUs !== null && timestampUs <= this.lastDisplayedPtsUs) {
           this.sampledVideoFrames++;
+          this.droppedFrames++;
           frame.close();
           return;
         }
-        this.videoFrames.push(frame);
+        const lastFrame = this.videoFrames[this.videoFrames.length - 1];
+        if (!lastFrame || Number(lastFrame.timestamp) <= timestampUs) {
+          this.videoFrames.push(frame);
+        } else {
+          let insertion = this.videoFrames.length - 1;
+          while (insertion > 0
+            && Number(this.videoFrames[insertion - 1].timestamp) > timestampUs) {
+            insertion--;
+          }
+          this.videoFrames.splice(insertion, 0, frame);
+        }
         this.trimVideoOutput();
       }
 
@@ -595,64 +1293,105 @@
         const elapsedSeconds = elapsedMs / 1000;
         const rafFps = this.frameRateWindowRafCount / elapsedSeconds;
         const renderedFrames = this.renderedFrames - this.frameRateWindowRenderedFrames;
-        const expectedFps = this.sourceVideoFps > 0
-          ? Math.min(this.targetVideoFps, this.sourceVideoFps)
-          : this.targetVideoFps;
+        const sourceFrameCount = this.frameRateWindowSourceFrames;
+        const sourceRate = measureSourceVideoRate(
+          sourceFrameCount,
+          elapsedSeconds,
+          this.frameRateWindowSourceFirstPtsUs,
+          this.frameRateWindowSourceLastPtsUs,
+        );
+        this.lastMeasuredSourceArrivalFps = sourceRate.sourceArrivalFps;
+        this.lastMeasuredSourcePtsFps = sourceRate.sourcePtsFps;
+        this.lastMeasuredSourceFps = sourceRate.measuredSourceFps;
+        if (sourceFrameCount >= 2) {
+          this.updateSourceVideoRate(sourceRate.measuredSourceFps, now);
+        }
+
+        const sourceAvailability = evaluateSourceAvailability({
+          targetVideoFps: this.targetVideoFps,
+          sourceNominalVideoFps: this.sourceNominalVideoFps,
+          sourceArrivalFps: sourceRate.sourceArrivalFps,
+          sourcePtsFps: sourceRate.sourcePtsFps,
+        });
+        const expectedFps = sourceAvailability.expectedFps;
         const presentationRatio = expectedFps > 0
           ? renderedFrames / (expectedFps * elapsedSeconds)
           : 1;
         const presentationFps = renderedFrames / elapsedSeconds;
+        const intervalSamples = this.frameRateWindowPresentationIntervals;
+        const meanPresentationIntervalMs = intervalSamples > 0
+          ? this.frameRateWindowPresentationIntervalSumMs / intervalSamples
+          : 0;
+        const presentationIntervalVarianceMs2 = intervalSamples > 0
+          ? Math.max(
+            0,
+            this.frameRateWindowPresentationIntervalSquareSumMs / intervalSamples
+              - meanPresentationIntervalMs * meanPresentationIntervalMs,
+          )
+          : 0;
         const longRafRatio = this.frameRateWindowRafCount > 0
           ? this.frameRateWindowLongRafCount / this.frameRateWindowRafCount
           : 0;
         this.lastMeasuredRafFps = rafFps;
         this.lastMeasuredPresentationFps = presentationFps;
+        this.lastPresentationIntervalVarianceMs2 = presentationIntervalVarianceMs2;
+        this.lastPresentationIntervalStdDevMs = Math.sqrt(presentationIntervalVarianceMs2);
         this.lastPresentationRatio = presentationRatio;
         this.lastLongRafRatio = longRafRatio;
 
+        const sourceLimited = sourceAvailability.sourceLimited;
+        // 源流从掉帧状态恢复的第一窗口，解码器和 canvas 仍可能在等关键帧或
+        // 消化刚到的数据。该窗口同样不能把展示偏低归咎于本地性能。
+        const sourceRecovering = !sourceLimited && this.lastSourceLimited;
+        this.lastSourceLimited = sourceLimited;
+        this.lastSourceRecovering = sourceRecovering;
         const hasRecentVideoOutput = now - this.lastVideoOutputAt < 1500;
-        if (this.sourceVideoFps > 0 && hasRecentVideoOutput
+        const decoderBacklogged = this.videoInput.length > MAX_VIDEO_INPUT / 3
+          || this.videoInputBytes > MAX_VIDEO_INPUT_BYTES / 3
+          || (this.videoDecoder ? this.videoDecoder.decodeQueueSize >= 7 : false);
+        // 仅保留为 debug 诊断；它不能进入展示帧率控制，因为降低 canvas
+        // 频率不会减少预测编码视频必须执行的解码工作。
+        this.lastFrameRateBacklogged = decoderBacklogged;
+        if (this.sourceNominalVideoFps > 0 && hasRecentVideoOutput
           && Number.isFinite(rafFps) && rafFps > 0) {
-          const maximumFps = Math.min(
-            MAX_TARGET_VIDEO_FPS,
-            this.sourceVideoFps,
-            Math.max(1, rafFps * REQUIRED_PRESENTATION_RATIO),
-          );
-          const decoderBacklogged = this.videoInput.length > MAX_VIDEO_INPUT / 3
-            || this.videoInputBytes > MAX_VIDEO_INPUT_BYTES / 3
-            || (this.videoDecoder ? this.videoDecoder.decodeQueueSize >= 7 : false)
-            || this.videoFrames.length > Math.max(8, this.targetVideoFps * 0.35);
-          this.lastFrameRateBacklogged = decoderBacklogged;
-          const smooth = presentationRatio >= REQUIRED_PRESENTATION_RATIO
-            && longRafRatio <= 1 - REQUIRED_PRESENTATION_RATIO
-            && !decoderBacklogged;
-
-          if (this.targetVideoFps > maximumFps + 0.25 || !smooth) {
-            const step = Math.max(2, this.targetVideoFps * (1 - FRAME_RATE_DECREASE_RATIO));
-            // 不直接把目标跳到 maximumFps：该值在 CPU 短抖动时会很低，
-            // 一步跳变会导致抽帧相位和画面节奏忽高忽低。只向它靠近一个
-            // 固定小步，下一秒再重新测量 95% 平滑度。
-            const lowered = this.targetVideoFps - step;
-            const nextTarget = this.targetVideoFps > maximumFps
-              ? Math.max(maximumFps, lowered)
-              : lowered;
-            this.setTargetVideoFps(nextTarget);
-            this.frameRateStableSamples = 0;
-          } else {
-            this.frameRateStableSamples++;
-            if (this.frameRateStableSamples >= STABLE_SAMPLES_BEFORE_INCREASE
-              && this.targetVideoFps + 0.25 < maximumFps) {
-              const step = Math.max(1, this.targetVideoFps * (FRAME_RATE_INCREASE_RATIO - 1));
-              this.setTargetVideoFps(Math.min(maximumFps, this.targetVideoFps + step));
-              this.frameRateStableSamples = 0;
-            }
-          }
+          const control = evaluateFrameRateControl({
+            targetVideoFps: this.targetVideoFps,
+            preferredVideoFps: this.preferredVideoFps,
+            rafFps,
+            presentationRatio,
+            longRafRatio,
+            // 等关键帧也属于流/传输侧暂时不能供给可展示画面的状态；此时
+            // 降低 canvas 采样目标无法解决问题，反而会拖慢恢复后的展示。
+            sourceLimited: sourceLimited || sourceRecovering || this.waitingForKeyframe,
+            stableSamples: this.frameRateStableSamples,
+            limitedSamples: this.frameRateLimitedSamples,
+            recoveryCooldownSamples: this.frameRateRecoveryCooldownSamples,
+            recoveryBackoffSamples: this.frameRateRecoveryBackoffSamples,
+            recoveryProbeSamples: this.frameRateRecoveryProbeSamples,
+          });
+          this.setTargetVideoFps(control.targetVideoFps);
+          this.frameRateStableSamples = control.stableSamples;
+          this.frameRateLimitedSamples = control.limitedSamples;
+          this.frameRateRecoveryCooldownSamples = control.recoveryCooldownSamples;
+          this.frameRateRecoveryBackoffSamples = control.recoveryBackoffSamples;
+          this.frameRateRecoveryProbeSamples = control.recoveryProbeSamples;
+        } else {
+          // 尚未建立源帧率基线或已彻底停流时，不根据空窗口降低目标；等源帧
+          // 回来后再用新的到达样本判断，避免把一次断流固化成低帧率设置。
+          this.frameRateStableSamples = Math.max(0, this.frameRateStableSamples - 1);
+          this.frameRateLimitedSamples = 0;
         }
 
         this.frameRateWindowStartMs = now;
         this.frameRateWindowRafCount = 0;
         this.frameRateWindowLongRafCount = 0;
         this.frameRateWindowRenderedFrames = this.renderedFrames;
+        this.frameRateWindowPresentationIntervals = 0;
+        this.frameRateWindowPresentationIntervalSumMs = 0;
+        this.frameRateWindowPresentationIntervalSquareSumMs = 0;
+        this.frameRateWindowSourceFrames = 0;
+        this.frameRateWindowSourceFirstPtsUs = null;
+        this.frameRateWindowSourceLastPtsUs = null;
       }
 
       playbackMetrics() {
@@ -664,16 +1403,26 @@
         const audioFrameCount = this.audioInput.length
           + (this.audioDecoder ? this.audioDecoder.decodeQueueSize : 0)
           + this.audioSources.size;
+        // 做了真实已排程音频时长的统计，以防止出现服务端只按帧数误判水位的情况。
+        const audioBufferedMs = this.audioContext
+          ? Math.max(
+            0,
+            this.audioScheduleCursor - this.audioContext.currentTime
+              + audioOutputLatencySeconds(this.audioContext),
+          ) * 1000
+          : 0;
         const playbackClockMs = serverOffsetMs === null
           ? null
           : performance.now() + serverOffsetMs;
         const originServerMs = originByPath.get(this.streamPath);
-        // lastDisplayedPtsUs 是实际画面位置;页面 latent 会让它故意落后,
-        // 所以回报前补回对应的媒体时间,避免服务端把用户意图当成设备漂移。
-        const playbackPositionUs = this.lastDisplayedPtsUs !== null
-          && Number.isFinite(originServerMs)
-          ? originServerMs * 1000 + this.lastDisplayedPtsUs
+        // 做了页面 latent 的媒体时间补回，以防止出现服务端把用户设置的显示
+        // 延迟误判为设备时钟漂移的情况。
+        const toServerPlaybackPositionUs = (ptsUs) => Number.isFinite(originServerMs)
+          ? originServerMs * 1000 + ptsUs
             + EXTRA_LATENT_MS * this.playbackRate * 1000
+          : null;
+        const playbackPositionUs = this.lastDisplayedPtsUs !== null
+          ? toServerPlaybackPositionUs(this.lastDisplayedPtsUs)
           : null;
         return {
           clientId: playbackClientId,
@@ -681,8 +1430,13 @@
           videoBufferBytes,
           videoGapCount,
           audioFrameCount,
-          hasAudio: this.audioConfig !== null,
+          audioBufferedMs,
+          hasAudio: Boolean(this.audioConfig !== null
+            && this.audioContext?.state === 'running'),
           playbackPositionUs,
+          // 主时钟已接受速率的确认负责可靠去重；位置始终使用真实展示帧，
+          // 不能用“假设控速已完成”的时钟值提前结束纠偏。
+          appliedPlaybackRate: this.playbackRate,
           playbackClockMs,
         };
       }
@@ -692,16 +1446,17 @@
         this.feedbackInFlight = true;
         try {
           this.recoverStalledVideoDecoder();
+          this.ensureAudioContextRunning();
+          this.recoverStalledAudioDecoder();
+          this.recoverAudioScheduleHealth();
           const frameBacklog = this.videoFrames.length
             + (this.videoDecoder ? this.videoDecoder.decodeQueueSize : 0);
-          const degraded = frameBacklog > 120
-            || this.audioSources.size > 300
+          const videoDegraded = frameBacklog > 120
             || this.videoInput.length > MAX_VIDEO_INPUT
             || this.videoInputBytes > MAX_VIDEO_INPUT_BYTES;
-          this.degradedSamples = degraded ? this.degradedSamples + 1 : 0;
-          if (this.degradedSamples >= DEGRADED_RECYCLE_SAMPLES) {
-            this.recyclePipeline('degraded');
-            return;
+          this.videoDegradedSamples = videoDegraded ? this.videoDegradedSamples + 1 : 0;
+          if (this.videoDegradedSamples >= DEGRADED_VIDEO_RECOVERY_SAMPLES) {
+            this.recoverDegradedVideoPipeline();
           }
           const control = await fetchJsonWithTimeout(PLAYBACK_FEEDBACK_URL, {
             method: 'POST',
@@ -720,16 +1475,15 @@
         }
       }
 
-      recyclePipeline(reason) {
-        if (this.recycling || !this.running || this.fatal) return;
-        this.recycling = true;
-        this.degradedSamples = 0;
-        setStatus('播放器运行时间过长，正在重建解码管线…', true);
-        this.abortController?.abort();
-        this.resetPipeline();
-        // Keep a running AudioContext across recycling. Recreating it outside
-        // the original user gesture can leave the replacement suspended.
-        void reason;
+      recoverDegradedVideoPipeline() {
+        if (!this.running || this.fatal) return;
+        this.videoDegradedSamples = 0;
+        this.videoPipelineRecoveries++;
+        setStatus('视频解码管线持续积压，正在等待关键帧恢复…', true);
+        const videoConfig = this.videoConfig;
+        this.closeVideoDecoder();
+        this.waitingForKeyframe = true;
+        if (videoConfig) this.configureVideo(videoConfig);
       }
 
       resetForRealignment() {
@@ -742,6 +1496,11 @@
         this.startPerfMs = null;
         this.lastInputPtsUs = null;
         this.lastDisplayedPtsUs = null;
+        this.frameRateStableSamples = 0;
+        this.frameRateLimitedSamples = 0;
+        this.frameRateRecoveryCooldownSamples = 0;
+        this.frameRateRecoveryBackoffSamples = 0;
+        this.frameRateRecoveryProbeSamples = 0;
         if (this.context) this.context.clearRect(0, 0, this.canvas.width, this.canvas.height);
         setStatus('正在重新对齐播放器时钟…');
       }
@@ -765,6 +1524,9 @@
         } else {
           this.startPerfMs = performance.now() + playbackLatencyMs();
         }
+        // 音频配置往往会先于第一张关键帧到达。时间轴一旦建立，立即消费此前
+        // 保留的压缩音频，而不是让这些输出在 mediaBaseUs 为 null 时被丢弃。
+        this.pumpAudio();
         return true;
       }
 
@@ -899,8 +1661,28 @@
         const Context = window.AudioContext || window.webkitAudioContext;
         if (!Context) return null;
         try {
-          this.audioContext = new Context();
-          this.audioContext.resume().catch(() => {});
+          const context = new Context({ latencyHint: 'interactive' });
+          context.onstatechange = () => {
+            if (this.audioContext !== context) return;
+            if (context.state === 'running') {
+              if (this.audioAnchorMediaUs !== null) {
+                this.realignAudioSchedule(this.currentTargetUs());
+              }
+              this.pumpAudio();
+            } else {
+              this.ensureAudioContextRunning();
+            }
+            refreshAudioUnlockVisibility();
+          };
+          if ('onsinkchange' in context) {
+            context.onsinkchange = () => {
+              if (this.audioContext === context && context.state === 'running') {
+                this.realignAudioSchedule(this.currentTargetUs());
+              }
+            };
+          }
+          this.audioContext = context;
+          this.ensureAudioContextRunning();
         } catch (_) {
           this.audioContext = null;
         }
@@ -911,12 +1693,30 @@
         if (!this.audioConfig || this.audioDecoder || typeof AudioDecoder === 'undefined') return;
         if (typeof EncodedAudioChunk === 'undefined') return;
         if (!this.createAudioContextIfNeeded()) return;
+        const nowPerfMs = performance.now();
+        this.audioDecoderGraceUntil = Math.max(
+          this.audioDecoderGraceUntil,
+          nowPerfMs + this.audioDecoderStallThresholdMs(),
+        );
+        const generation = this.audioDecoderGeneration;
         try {
           this.audioDecoder = new AudioDecoder({
-            output: (audioData) => this.scheduleAudio(audioData),
+            output: (audioData) => {
+              if (generation !== this.audioDecoderGeneration) {
+                audioData.close();
+                return;
+              }
+              this.lastAudioOutputAt = performance.now();
+              this.audioDecoderGraceUntil = 0;
+              this.scheduleAudio(audioData);
+              // 解码器输出会降低 decodeQueueSize；继续泵送能够让解锁前积压的
+              // 有效 AAC 在同一轮恢复里排完，而不必等待下一包网络音频来触发。
+              this.pumpAudio();
+            },
             error: () => {
-              if (!this.fatal) setStatus('音频解码不可用，视频仍可继续播放');
-              this.closeAudioDecoder();
+              if (generation !== this.audioDecoderGeneration || this.fatal) return;
+              setStatus('音频解码不可用，视频仍可继续播放');
+              this.closeAudioDecoderInstance();
             }
           });
           this.audioDecoder.configure({
@@ -926,7 +1726,7 @@
             numberOfChannels: this.audioConfig.channels
           });
         } catch (_) {
-          this.closeAudioDecoder();
+          this.closeAudioDecoderInstance();
           setStatus('音频解码不可用，视频仍可继续播放');
         } finally {
           refreshAudioUnlockVisibility();
@@ -934,7 +1734,12 @@
       }
 
       pumpAudio() {
-        if (!this.audioDecoder || !this.audioContext || this.fatal) return;
+        if (!this.audioDecoder || this.fatal
+          || !audioClockIsReady(this.audioContext, this.mediaBaseUs, this.startPerfMs)) {
+          refreshAudioUnlockVisibility();
+          return;
+        }
+        this.audioInput = retainSchedulableAudioInput(this.audioInput, this.currentTargetUs());
         while (this.audioInput.length && this.audioDecoder.decodeQueueSize < 8) {
           const item = this.audioInput.shift();
           try {
@@ -948,105 +1753,154 @@
         }
       }
 
+      realignAudioSchedule(currentTargetUs, nowPerfMs = performance.now()) {
+        if (!this.audioContext) return;
+        const nowAudio = this.audioContext.currentTime;
+        let playingEnd = nowAudio;
+        for (const entry of [...this.audioSources]) {
+          const canFinishNaturally = Number.isFinite(entry.startAt)
+            && Number.isFinite(entry.endAt)
+            && entry.startAt <= nowAudio + 0.002
+            && entry.endAt > nowAudio
+            && entry.endAt <= nowAudio + MAX_PRESERVED_AUDIO_SOURCE_SECONDS;
+          if (canFinishNaturally) {
+            playingEnd = Math.max(playingEnd, entry.endAt);
+          } else {
+            this.releaseAudioEntry(entry);
+          }
+        }
+        const desiredContextTime = audioContextTimeForPerformance(
+          this.audioContext,
+          nowPerfMs + EXTRA_AUDIO_LATENT_MS,
+        );
+        this.audioAnchorMediaUs = currentTargetUs;
+        this.audioAnchorContextTime = Math.max(
+          playingEnd,
+          nowAudio + AUDIO_SCHEDULE_LEAD_SECONDS,
+          desiredContextTime,
+        );
+        this.audioScheduleCursor = this.audioAnchorContextTime;
+        this.audioScheduledUntilPtsUs = currentTargetUs;
+        this.audioScheduleRate = this.playbackRate;
+        this.audioStretchFrameRemainder = 0;
+      }
+
       scheduleAudio(audioData) {
-        if (!this.audioContext || this.audioContext.state !== 'running' || this.mediaBaseUs === null) {
+        if (!audioClockIsReady(this.audioContext, this.mediaBaseUs, this.startPerfMs)) {
           audioData.close();
           refreshAudioUnlockVisibility();
           return;
         }
+        let pendingEntry = null;
         try {
-          const channels = Math.min(audioData.numberOfChannels, 8);
-          const buffer = this.audioContext.createBuffer(channels, audioData.numberOfFrames, audioData.sampleRate);
-          for (let channel = 0; channel < channels; channel++) {
-            const samples = new Float32Array(audioData.numberOfFrames);
-            audioData.copyTo(samples, { planeIndex: channel, format: 'f32-planar' });
-            buffer.copyToChannel(samples, channel);
-          }
           const timestampUs = Number.isFinite(audioData.timestamp) ? audioData.timestamp : this.mediaBaseUs;
           if (this.lastAudioPtsUs !== null && timestampUs < this.lastAudioPtsUs) {
-            audioData.close();
             return;
           }
           this.lastAudioPtsUs = timestampUs;
-          const relativeSeconds = (timestampUs - this.mediaBaseUs) / 1000000;
-          if (this.audioBaseContextTime === null) {
-            const videoDelay = Math.max(0, ((this.startPerfMs || performance.now()) - performance.now()) / 1000);
-            this.audioBaseContextTime = this.audioContext.currentTime + Math.max(0.03, videoDelay)
-              + EXTRA_AUDIO_LATENT_MS / 1000
-              - relativeSeconds / this.playbackRate;
+          const nowPerfMs = performance.now();
+          const nowAudio = this.audioContext.currentTime;
+          this.pruneAudioSources();
+          const inputDurationUs = audioData.numberOfFrames / audioData.sampleRate * 1000000;
+          if (this.audioAnchorMediaUs === null || this.audioAnchorContextTime === null) {
+            const desiredPerfMs = this.startPerfMs
+              + (timestampUs - this.mediaBaseUs) / this.playbackRate / 1000
+              + EXTRA_AUDIO_LATENT_MS;
+            this.audioAnchorMediaUs = timestampUs;
+            this.audioAnchorContextTime = Math.max(
+              nowAudio + AUDIO_SCHEDULE_LEAD_SECONDS,
+              audioContextTimeForPerformance(this.audioContext, desiredPerfMs),
+            );
+            this.audioScheduleCursor = this.audioAnchorContextTime;
+            this.audioScheduledUntilPtsUs = timestampUs;
+            this.audioScheduleRate = this.playbackRate;
+            this.audioStretchFrameRemainder = 0;
           }
-          let startAt = this.audioBaseContextTime + relativeSeconds / this.playbackRate;
-          const earliest = this.audioContext.currentTime + 0.02;
+
+          const scheduledUntilPtsUs = this.audioScheduledUntilPtsUs;
+          const mediaGapUs = scheduledUntilPtsUs === null
+            ? 0
+            : timestampUs - scheduledUntilPtsUs;
+          if (mediaGapUs < -AUDIO_CONTIGUITY_TOLERANCE_US) return;
+          const mappedStartAt = this.audioAnchorContextTime
+            + (timestampUs - this.audioAnchorMediaUs) / this.audioScheduleRate / 1000000;
+          // 连续 AAC 块永远首尾相接。毫秒 FLV 时间戳和整数 PCM 帧之间的几微秒
+          // 量化差不能演变成每 21ms 一次的微小空洞/重叠。
+          let startAt = Math.abs(mediaGapUs) <= AUDIO_CONTIGUITY_TOLERANCE_US
+            ? this.audioScheduleCursor
+            : Math.max(mappedStartAt, this.audioScheduleCursor);
+          const earliest = nowAudio + AUDIO_SCHEDULE_LEAD_SECONDS;
           if (startAt < earliest) {
             const lateSeconds = earliest - startAt;
             if (lateSeconds > MAX_AUDIO_LATE_SCHEDULE_SECONDS) {
               // 音频解码落后太多时只丢弃过期声音；绝不能为了补音频把
               // 视频主时钟整体后移，否则每次短暂卡顿都会积成长期掉帧。
-              const currentTargetUs = this.currentTargetUs();
-              const currentRelativeSeconds = (currentTargetUs - this.mediaBaseUs) / 1000000;
-              this.audioBaseContextTime = this.audioContext.currentTime
-                - currentRelativeSeconds / this.playbackRate;
+              this.recoverAudioSchedule('late-input', nowPerfMs);
               return;
             }
             // 小幅晚到直接贴着安全边界播放，保持媒体主时钟不变。
             startAt = earliest;
           }
-          startAt = Math.max(startAt, this.audioScheduleCursor);
           // A/V clock drift or a stalled display loop can leave a growing set
           // of AudioBufferSourceNodes scheduled minutes or hours in the future.
           // Detect that backlog and remap audio to the current display target;
           // an audible jump is preferable to an increasingly sluggish page.
-          const nowAudio = this.audioContext.currentTime;
-          const scheduleAheadSeconds = Math.max(
-            2,
-            playbackLatencyMs() / 1000 + EXTRA_AUDIO_LATENT_MS / 1000 + 2,
-          );
-          if (startAt > nowAudio + scheduleAheadSeconds
-            || this.audioSources.size > MAX_AUDIO_SOURCES) {
-            setStatus('音频调度积压，正在重新对齐…', true);
-            const currentTargetUs = this.currentTargetUs();
-            const currentRelativeSeconds = (currentTargetUs - this.mediaBaseUs) / 1000000;
-            for (const entry of [...this.audioSources]) {
-              if (entry.startAt > nowAudio + 0.05) {
-                this.releaseAudioEntry(entry);
-              }
-            }
-            this.audioBaseContextTime = nowAudio
-              - currentRelativeSeconds / this.playbackRate;
-            this.audioScheduleCursor = nowAudio + 0.02;
-            startAt = this.audioBaseContextTime
-              + relativeSeconds / this.playbackRate;
-            if (startAt < earliest) {
-              if (earliest - startAt > MAX_AUDIO_LATE_SCHEDULE_SECONDS) {
-                return;
-              }
-              startAt = earliest;
-            }
-            startAt = Math.max(startAt, this.audioScheduleCursor);
-            if (startAt > nowAudio + scheduleAheadSeconds) {
-              return;
-            }
+          const scheduleReason = audioScheduleRecoveryReason({
+            anchored: true,
+            currentTime: nowAudio,
+            scheduleCursor: Math.max(startAt, this.audioScheduleCursor),
+            sourceCount: this.audioSources.size,
+            maximumAheadSeconds: this.maximumAudioScheduleAheadSeconds(),
+          });
+          if (scheduleReason) {
+            this.recoverAudioSchedule(scheduleReason, nowPerfMs);
+            return;
           }
+
+          const channels = Math.min(audioData.numberOfChannels, 8);
+          const planes = [];
+          for (let channel = 0; channel < channels; channel++) {
+            const samples = new Float32Array(audioData.numberOfFrames);
+            audioData.copyTo(samples, { planeIndex: channel, format: 'f32-planar' });
+            planes.push(samples);
+          }
+          const stretched = stretchedAudioFrameCount(
+            audioData.numberOfFrames,
+            this.audioScheduleRate,
+            this.audioStretchFrameRemainder,
+          );
+          const buffer = makePitchPreservedAudioBuffer(
+            this.audioContext,
+            planes,
+            audioData.sampleRate,
+            this.audioScheduleRate,
+            stretched.frameCount,
+          );
           const source = this.audioContext.createBufferSource();
           source.buffer = buffer;
-          source.playbackRate.value = this.playbackRate;
           source.connect(this.audioContext.destination);
           const entry = {
             source,
             startAt,
             duration: buffer.duration,
-            rate: this.playbackRate,
-            endAt: startAt + buffer.duration / this.playbackRate
+            // 做了按 WSOLA 伸缩后缓冲区时长计算结束时间，以防止出现再次按
+            // 节点 playbackRate 换算而把音频变速变调的情况。
+            endAt: startAt + buffer.duration
           };
+          pendingEntry = entry;
           this.audioSources.add(entry);
-          source.onended = () => {
-            this.audioSources.delete(entry);
-            source.disconnect();
-          };
+          source.onended = () => this.releaseAudioEntry(entry);
           source.start(startAt);
+          pendingEntry = null;
           this.audioScheduleCursor = entry.endAt;
-        } catch (_) {
-          // 音频是可选轨道，音频转换失败不影响视频画面。
+          this.audioScheduledUntilPtsUs = timestampUs + inputDurationUs;
+          this.audioStretchFrameRemainder = stretched.remainder;
+        } catch (error) {
+          if (pendingEntry) this.releaseAudioEntry(pendingEntry);
+          this.audioScheduleErrors++;
+          this.lastAudioScheduleError = error instanceof Error ? error.message : String(error);
+          this.lastAudioScheduleErrorAt = performance.now();
+          // 单个 PCM 块转换失败只丢该块；不要把局部错误扩大成音视频重连。
         } finally {
           audioData.close();
         }
@@ -1072,7 +1926,9 @@
           try {
             const next = parseAudioConfig(tag.data.slice(2), Boolean(tag.data[0] & 1));
             if (next.key !== this.audioConfigKey) {
-              this.closeAudioDecoder();
+              // 新配置只替换 decoder；已排程 PCM 让它自然播完，新格式从同一
+              // audioScheduleCursor 接上，避免长流中编码器重配造成爆音。
+              this.closeAudioDecoderInstance();
               this.audioConfig = next;
               this.audioConfigKey = next.key;
               this.configureAudio();
@@ -1083,11 +1939,24 @@
           return;
         }
         if (packetType !== 1 || !this.audioConfig || tag.data.length <= 2) return;
+        const nowPerfMs = performance.now();
+        const stallThresholdMs = this.audioDecoderStallThresholdMs();
+        const activeWindowMs = Math.max(AUDIO_INPUT_ACTIVE_WINDOW_MS, stallThresholdMs * 3);
+        if (this.lastAudioInputAt === 0 || nowPerfMs - this.lastAudioInputAt > activeWindowMs) {
+          // 真正的源静音结束后给 decoder 一个完整输出窗口；连续输入期间不能
+          // 重置该宽限期，否则“吞输入但不输出”的停滞会永远漏检。
+          this.audioDecoderGraceUntil = nowPerfMs + stallThresholdMs;
+        }
+        this.lastAudioInputAt = nowPerfMs;
+        this.ensureAudioContextRunning(nowPerfMs);
         if (!this.audioDecoder) this.configureAudio();
         if (!this.audioDecoder) return;
         this.audioInput.push({ timestampUs: tag.timestampUs, data: tag.data.slice(2) });
-        if (this.audioInput.length > MAX_AUDIO_INPUT) this.audioInput = this.audioInput.slice(-30);
+        if (this.audioInput.length > MAX_AUDIO_INPUT) {
+          this.audioInput = this.audioInput.slice(-MAX_AUDIO_INPUT);
+        }
         this.pumpAudio();
+        this.recoverStalledAudioDecoder(nowPerfMs);
       }
 
       handleTag(tag) {
@@ -1099,33 +1968,28 @@
       renderFrame(now) {
         this.observeFrameRate(now);
         if (this.mediaBaseUs !== null && this.startPerfMs !== null) {
-          // 由服务端根据所有播放端水位下发速率,不再因解码队列稍有积压就
-          // 无条件追帧,给浏览器保留完成解码的时间。
+          // 做了由服务端按播放端水位统一控速，以防止出现解码队列稍有积压就
+          // 无条件追帧而不给浏览器留出完成解码时间的情况。
           let targetPtsUs = this.currentTargetUs(now);
           if (this.lastInputPtsUs !== null && targetPtsUs > this.lastInputPtsUs + 500000) {
-            const correctedTargetUs = this.lastInputPtsUs
-              + playbackLatencyMs() * 1000;
             this.startPerfMs = now
               - (this.lastInputPtsUs - this.mediaBaseUs) / (this.playbackRate * 1000)
               + playbackLatencyMs() / this.playbackRate;
-            if (this.audioContext && this.audioBaseContextTime !== null) {
-              const correctedRelativeSeconds = (correctedTargetUs - this.mediaBaseUs) / 1000000;
-              this.audioBaseContextTime = this.audioContext.currentTime
-                - correctedRelativeSeconds / this.playbackRate;
-              const correctedAudioSeconds = this.audioContext.currentTime;
-              for (const entry of [...this.audioSources]) {
-                if (entry.startAt > correctedAudioSeconds + 0.05) {
-                  this.releaseAudioEntry(entry);
-                }
-              }
-              this.audioScheduleCursor = correctedAudioSeconds;
-            }
+            // 做了视频追帧与已计划音频的隔离，以防止出现为追画面重排音频而
+            // 截断音节、引入爆音或再次产生变调感的情况。
             targetPtsUs = this.currentTargetUs(now);
           }
+          if (!this.videoPresentationIsDue(now)) return;
+          const earlyPresentationUs = this.sourceNominalVideoFps > 0
+            ? Math.min(8000, 500000 / this.sourceNominalVideoFps)
+            : 0;
           let selected = null;
-          while (this.videoFrames.length && Number(this.videoFrames[0].timestamp) <= targetPtsUs) {
+          while (this.videoFrames.length
+            && Number(this.videoFrames[0].timestamp) <= targetPtsUs + earlyPresentationUs) {
             if (selected) {
               selected.close();
+              this.sampledVideoFrames++;
+              this.droppedFrames++;
             }
             selected = this.videoFrames.shift();
           }
@@ -1140,9 +2004,39 @@
             }
             this.lastDisplayedPtsUs = Number(selected.timestamp);
             this.renderedFrames++;
+            if (this.lastVideoPresentationMs !== null) {
+              const presentationIntervalMs = now - this.lastVideoPresentationMs;
+              this.frameRateWindowPresentationIntervals++;
+              this.frameRateWindowPresentationIntervalSumMs += presentationIntervalMs;
+              this.frameRateWindowPresentationIntervalSquareSumMs += presentationIntervalMs
+                * presentationIntervalMs;
+            }
+            this.lastVideoPresentationMs = now;
+            this.nextVideoPresentationMs = advanceVideoPresentationDeadline(
+              this.nextVideoPresentationMs,
+              now,
+              this.targetVideoFps,
+            );
             selected.close();
           }
         }
+      }
+
+      unwrapFlvTimestamp(rawTimestampMs) {
+        const originServerMs = originByPath.get(this.streamPath);
+        const expectedTimestampMs = Number.isFinite(originServerMs) && serverOffsetMs !== null
+          ? performance.now() + serverOffsetMs - originServerMs
+          : null;
+        const timestampMs = unwrapFlvTimestampMs(
+          rawTimestampMs,
+          this.lastFlvTimestampMs,
+          expectedTimestampMs,
+        );
+        this.lastFlvTimestampMs = this.lastFlvTimestampMs === null
+          ? timestampMs
+          : Math.max(this.lastFlvTimestampMs, timestampMs);
+        this.flvTimestampWrapOffsetMs = timestampMs - rawTimestampMs;
+        return timestampMs;
       }
 
       readFlvTag(buffer, offset = 0) {
@@ -1161,7 +2055,8 @@
         const dataSize = u24(buffer, offset + 1);
         const total = 11 + dataSize + 4;
         if (buffer.length - offset < total) return null;
-        const timestamp = u24(buffer, offset + 4) + buffer[offset + 7] * 0x1000000;
+        const rawTimestamp = u24(buffer, offset + 4) + buffer[offset + 7] * 0x1000000;
+        const timestamp = this.unwrapFlvTimestamp(rawTimestamp);
         const dataStart = offset + 11;
         return {
           consumed: total,
@@ -1216,11 +2111,6 @@
               await this.readConnection();
               delay = 100;
             } catch (error) {
-              if (error.name === 'AbortError' && this.recycling) {
-                this.recycling = false;
-                delay = 100;
-                continue;
-              }
               if (!this.running || this.fatal || error.name === 'AbortError') break;
               this.resetPipeline();
               setStatus(error.message + '，正在重连…');
@@ -1238,17 +2128,17 @@
           refreshAudioUnlockVisibility();
           return;
         }
-        if (context.state === 'running') {
+        const continueAudio = () => {
           if (this.audioConfig && !this.audioDecoder) this.configureAudio();
+          this.pumpAudio();
           refreshAudioUnlockVisibility();
+        };
+        if (context.state === 'running') {
+          continueAudio();
           return;
         }
         context.resume().then(() => {
-          if (this.audioConfig) {
-            this.closeAudioDecoder();
-            this.configureAudio();
-          }
-          refreshAudioUnlockVisibility();
+          continueAudio();
         }).catch(() => {
           refreshAudioUnlockVisibility();
         });
@@ -1257,7 +2147,6 @@
       stop() {
         this.running = false;
         if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-        if (this.recycleTimer) clearInterval(this.recycleTimer);
         if (this.abortController) this.abortController.abort();
         this.resetPipeline();
         if (this.audioContext) {
@@ -1274,7 +2163,11 @@
 
     // 当前页面路径即默认流（与旧版单流页面行为一致）。
     // 页面参数只属于播放器,不传给 FLV 服务端。
-    const ownUrl = new URL(location.pathname + '.flv', location.href).href;
+    const ownFlvUrl = new URL(location.pathname + '.flv', location.href);
+    // 内置播放器自己按服务端时钟排程，因此请求一段发送提前量作为解码与
+    // 音频防抖缓冲；普通 .flv 拉流地址不带该标记，兼容行为不变。
+    ownFlvUrl.searchParams.set('livesuite-player', '1');
+    const ownUrl = ownFlvUrl.href;
 
     const audioUnlockButton = document.getElementById('audio-unlock');
     function refreshAudioUnlockVisibility() {
@@ -1299,7 +2192,7 @@
     const session = new StreamSession(ownPath, ownUrl, makeCanvas());
     sessions.push(session);
     if (pageParams.get('debug') === '1') {
-      window.__livesuitePlayer = { sessions };
+      window.__livesuitePlayer = { buildId: PLAYER_BUILD_ID, sessions };
     }
     session.runConnections();
     setInterval(() => {
