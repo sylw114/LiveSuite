@@ -274,4 +274,40 @@ assert.ok(Number.isFinite(
   helpers.advanceVideoPresentationDeadline(0, 7 * 24 * 3600 * 1000, 53.7),
 ));
 
+// Cadence detection and phase centring. A 30fps source on a 60Hz display is
+// locked at two ticks per frame; on 144Hz (4.8 ticks) there is no cadence to
+// lock. Frames whose eligible moment sits right at a tick boundary are moved
+// to the middle of the interval so jitter cannot flip them between ticks.
+const presentationConstants = [...html.matchAll(/^ {4}const ([A-Z_0-9]+) = ([^;\n]+);$/gm)]
+  .map((match) => `const ${match[1]} = ${match[2]};`).join('\n');
+const presentation = new Function(
+  presentationConstants + '\n'
+    + 'function clampNumber(value, minimum, maximum) { return Math.min(maximum, Math.max(minimum, value)); }\n'
+    + html.slice(html.indexOf('function medianOf('), html.indexOf('// ============ 单流播放会话'))
+    + '\nreturn { presentationCadence, evaluatePresentationPhase, medianOf };',
+)();
+assert.deepStrictEqual(presentation.presentationCadence({ displayIntervalMs: 1000 / 60, sourceFps: 30, targetVideoFps: 60 }),
+  { locked: true, ticksPerFrame: 2 });
+assert.deepStrictEqual(presentation.presentationCadence({ displayIntervalMs: 1000 / 60, sourceFps: 60, targetVideoFps: 60 }),
+  { locked: true, ticksPerFrame: 1 });
+assert.strictEqual(presentation.presentationCadence({ displayIntervalMs: 1000 / 144, sourceFps: 30, targetVideoFps: 60 }).locked, false,
+  "4.8 ticks per frame is not a cadence");
+assert.strictEqual(presentation.presentationCadence({ displayIntervalMs: 1000 / 60, sourceFps: 60, targetVideoFps: 40 }).locked, false,
+  "a locally sampled target has no cadence to centre");
+function phaseSums(phases) {
+  return phases.reduce((sums, phase) => ({
+    sinSum: sums.sinSum + Math.sin(2 * Math.PI * phase),
+    cosSum: sums.cosSum + Math.cos(2 * Math.PI * phase),
+    count: sums.count + 1,
+  }), { sinSum: 0, cosSum: 0, count: 0 });
+}
+const phaseTickMs = 1000 / 60;
+const nearEdge = presentation.evaluatePresentationPhase({ ...phaseSums([0.04, 0.06, 0.05, 0.03, 0.07, 0.05]), displayIntervalMs: phaseTickMs, locked: true });
+assert.ok(Math.abs(nearEdge.correctionMs - 0.45 * phaseTickMs) < 0.2, "frames at the tick edge are moved to the middle");
+const centred = presentation.evaluatePresentationPhase({ ...phaseSums([0.48, 0.52, 0.5, 0.49, 0.51, 0.5]), displayIntervalMs: phaseTickMs, locked: true });
+assert.strictEqual(centred.correctionMs, 0);
+const scattered = presentation.evaluatePresentationPhase({ ...phaseSums([0.1, 0.3, 0.5, 0.7, 0.9, 0.2]), displayIntervalMs: phaseTickMs, locked: true });
+assert.strictEqual(scattered.correctionMs, 0, "no correction without a concentrated phase");
+assert.strictEqual(presentation.evaluatePresentationPhase({ ...phaseSums([0.05, 0.05, 0.05, 0.05]), displayIntervalMs: phaseTickMs, locked: false }).correctionMs, 0);
+assert.strictEqual(presentation.medianOf([5, 1, 9, 3]), 4);
 console.log('Browser adaptive frame-rate control tests passed');

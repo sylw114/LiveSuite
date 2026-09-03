@@ -25,8 +25,6 @@ const PLAYBACK_FEEDBACK_TTL_MS = 2_500;
 const DEFAULT_ALIGNMENT_DELAY_MS = 180;
 const MAX_REPORTED_POSITION_US = Number.MAX_SAFE_INTEGER;
 const MAX_REPORTED_CLOCK_MS = Number.MAX_SAFE_INTEGER;
-/** 内置播放器提前收到媒体帧，由网页自己的媒体时钟完成最后一段平滑调度。 */
-export const BROWSER_PLAYER_MAX_RELEASE_LEAD_MS = 120;
 /** 位置控制留出超过两帧的死区，避免显示帧的离散 PTS 触发往返调速。 */
 export const POSITION_DRIFT_DEADBAND_MS = 55;
 export const POSITION_DRIFT_CORRECTION_MS = 100;
@@ -271,15 +269,14 @@ function targetPlaybackPosition(
   };
 }
 
-/** 为内置网页保留一段浏览器侧解码/音频调度余量；普通 FLV 客户端保持原行为。 */
+/** 内置网页一旦收到帧便自行缓存到实测显示时刻；普通 FLV 客户端保持原行为。 */
 export function browserPlayerReleaseLeadMs(alignmentDelayMs: number): number {
   if (!Number.isFinite(alignmentDelayMs)) {
     return 0;
   }
-  return Math.max(0, Math.min(
-    BROWSER_PLAYER_MAX_RELEASE_LEAD_MS,
-    alignmentDelayMs,
-  ));
+  // 不写死浏览器处理余量：服务端时间轴本身来自实际到达分布，内置播放器
+  // 立即取得已到达帧并把完整剩余量用于解码、WSOLA 和 FIFO。
+  return Math.max(0, alignmentDelayMs);
 }
 
 function steadyPlaybackControl(): PlaybackControl {
@@ -370,7 +367,7 @@ class PullConnection {
   constructor(
     private readonly stream: http.ServerResponse,
     private readonly session: PullSession,
-    private readonly releaseLeadMs = 0,
+    private readonly builtInBrowserPlayer = false,
   ) {
     this.timeline = new FlvTimeline(session.originServerMs);
   }
@@ -544,8 +541,14 @@ class PullConnection {
     }
     const now = epochMs();
     const maxHold = Math.max(500, this.session.alignmentDelayMs * 2);
+    // 对齐延迟会在音频到达窗口形成后动态增长。内置播放器的提前量也必须
+    // 跟随当前值重算；若在连接建立时固定，冷启动值偏小时该连接会永久缺少
+    // 音频解码/伸缩余量，即使服务端后来已经把共享对齐延迟抬高。
+    const releaseLeadMs = this.builtInBrowserPlayer
+      ? browserPlayerReleaseLeadMs(this.session.alignmentDelayMs)
+      : 0;
     const release = frame.timelineUs / 1000 + this.session.alignmentDelayMs
-      - this.releaseLeadMs;
+      - releaseLeadMs;
     return Math.min(now + maxHold, Math.max(now - maxHold, release));
   }
 }
@@ -575,6 +578,7 @@ export class QuicPullHub {
   private browserPlayerHtml: string | null = null;
   private includeAudio = false;
   private synchronizedPullStreams: boolean | null = null;
+  private alignmentReady = false;
   private alignmentDelayMs = DEFAULT_ALIGNMENT_DELAY_MS;
   private readonly playbackFeedback = new Map<string, PlaybackFeedback>();
   /** 做了每个浏览器的最近控速状态保存，以防止出现重复下发和纠偏滞回失效的情况。 */
@@ -671,6 +675,15 @@ export class QuicPullHub {
     if (previous) {
       this.endSession(previous);
     }
+    // 发送端进程重建后 sessionId 会变化，但同一路径仍是同一个发布槽。
+    // 立即结束旧拉流会话，避免 findByPath 继续命中断流前的缓冲并让刷新后的
+    // 播放器挂在永远不会再出帧的连接上。
+    for (const [sessionId, session] of this.sessions) {
+      if (sessionId !== info.sessionId && session.streamPath === info.streamPath) {
+        this.endSession(session);
+        this.sessions.delete(sessionId);
+      }
+    }
     this.sessions.set(info.sessionId, {
       ...info,
       includeAudio: this.includeAudio,
@@ -704,6 +717,7 @@ export class QuicPullHub {
   refreshOriginServerMs(): void {
     let syncInfo: {
       synchronize?: boolean;
+      alignmentReady?: boolean;
       alignmentDelayMs?: number;
       streams?: Array<{ path: string; originServerMs: number }>;
     } = {};
@@ -712,10 +726,13 @@ export class QuicPullHub {
     } catch {
       return;
     }
-    if (Number.isFinite(syncInfo.alignmentDelayMs) && syncInfo.alignmentDelayMs! > 0) {
+    if (Number.isFinite(syncInfo.alignmentDelayMs) && syncInfo.alignmentDelayMs! >= 0) {
       this.alignmentDelayMs = Math.min(60_000, Math.max(0, syncInfo.alignmentDelayMs!));
     }
     const synchronized = syncInfo.synchronize === true;
+    // Older native addons do not expose alignmentReady. Preserve their previous
+    // behavior while a newly built addon can explicitly hold synchronized starts.
+    this.alignmentReady = !synchronized || syncInfo.alignmentReady !== false;
     if (this.synchronizedPullStreams !== null && this.synchronizedPullStreams !== synchronized) {
       // FLV 时间戳的原点和服务端时间轴在开关切换时都会改变,旧连接不能
       // 继续混发两种时间轴;让网页从最新 GOP 重连并丢弃已播放分片。
@@ -992,6 +1009,7 @@ export class QuicPullHub {
         if (typeof info.alignmentDelayMs === 'number' && Number.isFinite(info.alignmentDelayMs)) {
           this.alignmentDelayMs = Math.min(60_000, Math.max(0, info.alignmentDelayMs));
         }
+        this.alignmentReady = info.synchronize !== true || info.alignmentReady !== false;
         // 做了同步轮询与控速下发的职责拆分，以防止出现每秒时钟采样把播放器
         // 反复推回某个倍速的情况。控速仅由反馈接口在状态变化时下发。
         body = JSON.stringify({
@@ -1047,10 +1065,17 @@ export class QuicPullHub {
   ): Promise<void> {
     const requestUrl = new URL(req.url ?? '/', 'http://livesuite.local');
     const isBuiltInBrowserPlayer = requestUrl.searchParams.get('livesuite-player') === '1';
-    const releaseLeadMs = isBuiltInBrowserPlayer
-      ? browserPlayerReleaseLeadMs(session.alignmentDelayMs)
-      : 0;
-    const connection = new PullConnection(res, session, releaseLeadMs);
+    // Do not rely on the background poll having run between page load and this
+    // request. Refresh synchronously so a just-registered synchronized stream
+    // cannot slip past the arrival-calibration gate during that short race.
+    this.refreshOriginServerMs();
+    if (isBuiltInBrowserPlayer && session.synchronized && !this.alignmentReady) {
+      // 等待真实音视频到达样本形成共享时间轴。浏览器会短退避重连并从最新
+      // GOP 起播，避免先按猜测值出画、首个慢音频到来后再大幅停顿校正。
+      writeHttpError(res, 425, 'Synchronizing media arrival');
+      return;
+    }
+    const connection = new PullConnection(res, session, isBuiltInBrowserPlayer);
     res.on('close', () => {
       session.connections.delete(connection);
       connection.close();

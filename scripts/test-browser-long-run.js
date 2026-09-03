@@ -3,81 +3,161 @@ const fs = require('fs');
 
 const html = fs.readFileSync('native/livesuite-quic/src/browser_player.html', 'utf8');
 
-const audioStart = html.indexOf('function clampNumber(');
-const audioEnd = html.indexOf('function audioClockIsReady(', audioStart);
-assert.ok(audioStart >= 0 && audioEnd > audioStart, 'audio timing helpers were not found');
-const audio = new Function(
-  'const AUDIO_STRETCH_GRAIN_SAMPLES = 256;\n'
-    + 'const AUDIO_STRETCH_SEARCH_SAMPLES = 32;\n'
-    + 'const AUDIO_SCHEDULE_LEAD_SECONDS = 0.015;\n'
-    + 'const MAX_AUDIO_SOURCES = 16384;\n'
-    + html.slice(audioStart, audioEnd)
-    + '\nreturn { stretchedAudioFrameCount, audioScheduleRecoveryReason };',
-)();
-
-// Simulate 24 hours of 48 kHz AAC-LC scheduling while the controller changes
-// rate every 256 ms. Fractional AudioBuffer rounding must stay bounded forever,
-// rather than accumulating a gap on every 1024-sample block.
-const audioBlocks = Math.ceil(24 * 60 * 60 * 48_000 / 1024);
-const rates = [0.99, 1, 1.01, 1, 0.97, 1, 1.03, 1];
-let remainder = 0;
-let scheduledFrames = 0;
-let exactFrames = 0;
-for (let block = 0; block < audioBlocks; block++) {
-  const rate = rates[Math.floor(block / 12) % rates.length];
-  const result = audio.stretchedAudioFrameCount(1024, rate, remainder);
-  scheduledFrames += result.frameCount;
-  exactFrames += 1024 / rate;
-  remainder = result.remainder;
+function slice(startMarker, endMarker) {
+  const start = html.indexOf(startMarker);
+  const end = html.indexOf(endMarker, start);
+  assert.ok(start >= 0 && end > start, `markers not found: ${startMarker} / ${endMarker}`);
+  return html.slice(start, end);
 }
-assert.ok(Math.abs(scheduledFrames - exactFrames) <= 0.5);
 
-assert.strictEqual(audio.audioScheduleRecoveryReason({
-  anchored: true,
-  currentTime: 100,
-  scheduleCursor: 220,
-  sourceCount: 12000,
-  maximumAheadSeconds: 122,
-}), null, 'a valid 120-second combined delay must not be mistaken for a stalled pipeline');
-assert.strictEqual(audio.audioScheduleRecoveryReason({
-  anchored: true,
-  currentTime: 100,
-  scheduleCursor: 223,
-  sourceCount: 10,
-  maximumAheadSeconds: 122,
-}), 'future-backlog');
-assert.strictEqual(audio.audioScheduleRecoveryReason({
-  anchored: true,
-  currentTime: 100,
-  scheduleCursor: 101,
-  sourceCount: 16384,
-  maximumAheadSeconds: 122,
-}), 'source-limit');
+const constants = [...html.matchAll(/^ {4}const ([A-Z_0-9]+) = ([^;\n]+);$/gm)]
+  .map((match) => `const ${match[1]} = ${match[2]};`).join('\n');
+const clamp = 'function clampNumber(value, minimum, maximum) { return Math.min(maximum, Math.max(minimum, value)); }\n';
 
-const videoStart = html.indexOf('function advanceVideoPresentationDeadline(');
-const videoEnd = html.indexOf('function evaluateFrameRateControl(', videoStart);
-assert.ok(videoStart >= 0 && videoEnd > videoStart, 'video pacing helper was not found');
-const video = new Function(
-  'const MIN_TARGET_VIDEO_FPS = 12;\n'
-    + 'const MAX_TARGET_VIDEO_FPS = 240;\n'
-    + 'const FRAME_RATE_EPSILON_FPS = 0.25;\n'
-    + 'const VIDEO_PRESENTATION_EPSILON_MS = 0.25;\n'
-    + 'function clampNumber(value, minimum, maximum) { return Math.min(maximum, Math.max(minimum, value)); }\n'
-    + html.slice(videoStart, videoEnd)
-    + '\nreturn { advanceVideoPresentationDeadline };',
+const audio = new Function(
+  constants + '\n' + clamp
+  + slice('class LinearResampler', '// AudioWorklet FIFO')
+  + slice('function audioSyncDeviationStep', 'function audioDecoderRecoveryReason(')
+  + '\nreturn { AudioTimeStretcher, audioSyncDeviationStep, audioEnqueuePlan, audioRenderedOutputFrame };',
 )();
 
+// Three minutes of 48 kHz audio through the continuous stretcher while the
+// rate changes every 256 ms. Total output must follow the requested schedule
+// to within one search window, internal bookkeeping must stay bounded, and
+// the output must never contain a splice larger than the source's own steps.
+{
+  const sampleRate = 48_000;
+  const stretcher = new audio.AudioTimeStretcher(1, sampleRate);
+  const rates = [0.99, 1, 1.01, 1, 0.97, 1, 1.03, 1];
+  const block = 1024;
+  const blocks = Math.ceil(180 * sampleRate / block);
+  const input = new Float32Array(block);
+  let phase = 0;
+  let expectedFrames = 0;
+  let producedFrames = 0;
+  let maxStep = 0;
+  let previousSample = 0;
+  let maxRetained = 0;
+  for (let index = 0; index < blocks; index++) {
+    const rate = rates[Math.floor(index / 12) % rates.length];
+    stretcher.setRate(rate);
+    for (let sample = 0; sample < block; sample++) {
+      input[sample] = Math.sin(phase);
+      phase += 2 * Math.PI * 330 / sampleRate;
+    }
+    assert.ok(stretcher.pushInput([input]), 'input ring must not overflow while output is drained');
+    expectedFrames += block / rate;
+    const planes = stretcher.process();
+    if (planes) {
+      const output = planes[0];
+      for (let sample = 0; sample < output.length; sample++) {
+        assert.ok(Number.isFinite(output[sample]));
+        maxStep = Math.max(maxStep, Math.abs(output[sample] - previousSample));
+        previousSample = output[sample];
+      }
+      producedFrames += output.length;
+    }
+    maxRetained = Math.max(maxRetained, stretcher.inputWritten - stretcher.inputKeepFrom);
+    assert.ok(stretcher.segments.length <= 512, 'segment history must stay bounded');
+  }
+  assert.ok(Math.abs(producedFrames - expectedFrames) <= 2 * stretcher.seek + stretcher.hop + block,
+    `stretched output drifted: ${producedFrames} vs ${expectedFrames}`);
+  assert.ok(maxStep <= Math.sin(2 * Math.PI * 330 / sampleRate) * 1.05, 'no audible splice over three minutes');
+  assert.ok(maxRetained < stretcher.capacity / 2, 'the input ring must recycle old samples');
+  assert.ok(stretcher.stats.maxSearchDeviation <= stretcher.seek);
+}
+
+// FIFO arithmetic after a day of playback stays exact and never runs ahead of
+// what was appended.
+{
+  const framesPerDay = 24 * 60 * 60 * 48_000;
+  const rendered = audio.audioRenderedOutputFrame({
+    status: { contextTime: 86_400, consumedFrames: framesPerDay },
+    appendedFrames: framesPerDay + 4800,
+    contextTimeNow: 86_400.05,
+    sampleRate: 48_000,
+  });
+  assert.strictEqual(rendered, framesPerDay + 2400);
+  assert.strictEqual(audio.audioRenderedOutputFrame({
+    status: { contextTime: 86_400, consumedFrames: framesPerDay },
+    appendedFrames: framesPerDay + 100,
+    contextTimeNow: 86_401,
+    sampleRate: 48_000,
+  }), framesPerDay + 100);
+}
+
+// The sync controller never leaves its bounds no matter how long it runs.
+{
+  let deviation = 0;
+  for (let step = 0; step < 24 * 60 * 60 * 50; step++) {
+    const errorMs = Math.sin(step / 500) * 400;
+    deviation = audio.audioSyncDeviationStep({ errorMs, deviation, allowFaster: step % 7 !== 0 });
+    if (Math.abs(deviation) > AUDIO_SYNC_MAX_DEVIATION_BOUND()) {
+      assert.fail(`deviation escaped its bound: ${deviation}`);
+    }
+  }
+  function AUDIO_SYNC_MAX_DEVIATION_BOUND() { return 0.0150001; }
+  assert.ok(Number.isFinite(deviation));
+}
+
+// Enqueue policy with far-future and far-past context times. The pure plan
+// skips a severely late block; the player promotes sustained lateness only
+// after it spans the source-derived observation window.
+assert.strictEqual(audio.audioEnqueuePlan({
+  fifoEmpty: true,
+  discontinuity: false,
+  desiredContextTime: 100_000,
+  queueEndContextTime: 99_999.5,
+}).action, 'pad');
+assert.strictEqual(audio.audioEnqueuePlan({
+  fifoEmpty: true,
+  discontinuity: false,
+  desiredContextTime: 100_000,
+  queueEndContextTime: 100_003,
+}).action, 'skip');
+
+// Worklet counters stay exact near 2^32 rendered frames (about a day at 48 kHz).
+{
+  const workletSource = new Function(
+    slice("const AUDIO_WORKLET_PROCESSOR_NAME = 'livesuite-audio-fifo';", '// 本地音画同步控制')
+    + '\nreturn AUDIO_WORKLET_SOURCE;',
+  )();
+  const registry = {};
+  globalThis.__livesuiteTestCurrentTime = 90_000;
+  class AudioWorkletProcessor {
+    constructor() { this.port = { onmessage: null, posted: [], postMessage(message) { this.posted.push(message); } }; }
+  }
+  new Function('AudioWorkletProcessor', 'registerProcessor',
+    workletSource.replace(/\bcurrentTime\b/g, 'globalThis.__livesuiteTestCurrentTime'))(
+    AudioWorkletProcessor, (name, processorClass) => { registry[name] = processorClass; },
+  );
+  const processor = new registry['livesuite-audio-fifo']();
+  processor.renderedFrames = 2 ** 32 - 64;
+  processor.consumedFrames = 2 ** 32 - 200;
+  processor.port.onmessage({ data: { type: 'push', planes: [new Float32Array(256).fill(0.1)], frames: 256 } });
+  processor.port.onmessage({ data: { type: 'configure', statusInterval: 1 } });
+  for (let index = 0; index < 3; index++) processor.process([], [[new Float32Array(128)]]);
+  assert.strictEqual(processor.renderedFrames, 2 ** 32 - 64 + 384);
+  assert.strictEqual(processor.consumedFrames, 2 ** 32 - 200 + 256);
+  const status = processor.port.posted[processor.port.posted.length - 1];
+  assert.strictEqual(status.renderedFrames, 2 ** 32 - 64 + 256);
+}
+
+// Video pacing and FLV timestamps over long sessions.
+const video = new Function(
+  constants + '\n' + clamp
+  + slice('function advanceVideoPresentationDeadline(', 'function evaluateFrameRateControl(')
+  + '\nreturn { advanceVideoPresentationDeadline };',
+)();
 const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
 const deadline = video.advanceVideoPresentationDeadline(1, thirtyDaysMs, 53.7);
 assert.ok(deadline > thirtyDaysMs);
 assert.ok(deadline - thirtyDaysMs <= 1000 / 53.7 + 0.001);
 
-const unwrapStart = html.indexOf('function unwrapFlvTimestampMs(');
-const unwrapEnd = html.indexOf('function signed24(', unwrapStart);
 const unwrap = new Function(
   'const FLV_TIMESTAMP_MODULUS_MS = 0x100000000;\n'
-    + html.slice(unwrapStart, unwrapEnd)
-    + '\nreturn unwrapFlvTimestampMs;',
+  + slice('function unwrapFlvTimestampMs(', 'function signed24(')
+  + '\nreturn unwrapFlvTimestampMs;',
 )();
 const threeWraps = 3 * 0x100000000 + 1234;
 assert.strictEqual(unwrap(1234, threeWraps - 16, threeWraps), threeWraps);
@@ -86,7 +166,7 @@ assert.ok(!html.includes('PIPELINE_RECYCLE_INTERVAL_MS'));
 assert.match(html, /if \(syncRequestInFlight\) return;/);
 assert.match(html, /for \(const frame of this\.videoFrames\)[\s\S]*?frame\.close\(\)/);
 assert.match(html, /finally \{[\s\S]*?audioData\.close\(\);[\s\S]*?\}/);
-assert.match(html, /source\.onended = \(\) => this\.releaseAudioEntry\(entry\);/);
-assert.match(html, /if \(pendingEntry\) this\.releaseAudioEntry\(pendingEntry\);/);
+assert.match(html, /if \(this\.audioFifoChunks\.length > 512\)/, 'FIFO chunk map must stay bounded');
+assert.match(html, /if \(this\.audioDecodeSubmitQueue\.length > 64\)/, 'decode submission queue must stay bounded');
 
 console.log('Browser 24-hour stability simulation passed');

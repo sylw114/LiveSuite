@@ -1,4 +1,5 @@
 const assert = require('assert');
+const fs = require('fs');
 const {
   evaluatePlaybackControl,
   QuicPullHub,
@@ -178,9 +179,52 @@ const overbuffered = control(0, {
 assert.strictEqual(overbuffered.reason, 'overbuffered');
 assert.strictEqual(overbuffered.playbackRate, NORMAL_PLAYBACK_RATE + MAX_PLAYBACK_RATE_STEP);
 
-assert.strictEqual(browserPlayerReleaseLeadMs(180), 120);
+assert.strictEqual(browserPlayerReleaseLeadMs(180), 180);
 assert.strictEqual(browserPlayerReleaseLeadMs(100), 100);
 assert.strictEqual(browserPlayerReleaseLeadMs(30), 30);
+const pullSource = fs.readFileSync('src/main/quicPull.ts', 'utf8');
+assert.match(
+  pullSource,
+  /const releaseLeadMs = this\.builtInBrowserPlayer[\s\S]*?browserPlayerReleaseLeadMs\(this\.session\.alignmentDelayMs\)/,
+  'an existing browser connection must recalculate release lead after alignment changes',
+);
+assert.match(
+  pullSource,
+  /session\.synchronized && !this\.alignmentReady[\s\S]*?Synchronizing media arrival/,
+  'a synchronized browser must wait for measured audio/video arrival before starting',
+);
+
+// A reconnect may use a fresh session id. The stream path is the publishing
+// slot, so a refreshed player must attach to the replacement rather than the
+// silent pre-reconnect session.
+{
+  const reconnectHub = new QuicPullHub({
+    takeFrames: () => ({ resync: false, closed: false, frames: [] }),
+    syncInfoJson: () => JSON.stringify({ synchronize: true, alignmentReady: true }),
+  }, {
+    bind: '127.0.0.1',
+    port: 0,
+  });
+  reconnectHub.registerSession({
+    sessionId: 'old-session',
+    streamPath: '/reconnected',
+    audioAvailable: true,
+    audioChannels: 2,
+    audioGroupDurationUs: 40_000,
+  });
+  let ended = 0;
+  reconnectHub.sessions.get('old-session').connections.add({ push() { ended++; } });
+  reconnectHub.registerSession({
+    sessionId: 'new-session',
+    streamPath: '/reconnected',
+    audioAvailable: true,
+    audioChannels: 2,
+    audioGroupDurationUs: 40_000,
+  });
+  assert.strictEqual(ended, 1);
+  assert.ok(!reconnectHub.sessions.has('old-session'));
+  assert.strictEqual(reconnectHub.findByPath('/reconnected').sessionId, 'new-session');
+}
 
 // Closed-loop simulation: a 150ms lead must converge monotonically without the
 // old 1x/correction/1x pulse train. The per-poll rate delta remains inaudible.
