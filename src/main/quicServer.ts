@@ -74,8 +74,6 @@ export interface LiveSuiteQuicMetrics extends LiveSuiteMediaStatus {
   frames: number;
   droppedFrames: number;
   lateFrames: number;
-  recoveredFragments: number;
-  packetLossRatio: number;
   bitrateKbps: number;
   fps: number;
   latencyMinMs: number | null;
@@ -435,8 +433,6 @@ export class LiveSuiteQuicServer extends EventEmitter {
         frames: finiteNumber(message.frames),
         droppedFrames: finiteNumber(message.droppedFrames),
         lateFrames: finiteNumber(message.lateFrames),
-        recoveredFragments: finiteNumber(message.recoveredFragments),
-        packetLossRatio: finiteNumber(message.packetLossRatio),
         bitrateKbps: finiteNumber(message.bitrateKbps),
         fps: finiteNumber(message.fps),
         latencyMinMs: nullableNumber(message.latencyMinMs),

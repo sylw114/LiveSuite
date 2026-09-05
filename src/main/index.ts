@@ -61,8 +61,8 @@ const mainMessages = {
     quicPortsConflict: 'QUIC 与 UDP 回退端口不能相同',
     quicErrorTitle: 'LiveSuite 低延迟服务器错误',
     quicStartFailed: 'LiveSuite 低延迟服务器启动失败。请检查接收程序、端口占用和防火墙设置。',
-    udpHighLatency: 'UDP 服务器：检测到高延迟！',
-    udpLatencyNormal: 'UDP 服务器：延迟已恢复正常。',
+    udpHighLatency: '音频服务器：检测到播放积压较高！',
+    udpLatencyNormal: '音频服务器：播放积压已恢复正常。',
     rtmpErrorTitle: 'RTMP 服务器错误',
     rtmpStartFailed: 'RTMP 服务器启动失败。请检查端口是否已被占用，或是否存在权限问题。',
   },
@@ -79,8 +79,8 @@ const mainMessages = {
     quicPortsConflict: 'QUIC and UDP fallback ports must be different',
     quicErrorTitle: 'LiveSuite Low-Latency Server Error',
     quicStartFailed: 'Failed to start the LiveSuite low-latency server. Check the receiver binary, port usage, and firewall settings.',
-    udpHighLatency: 'UDP Server: High latency detected!',
-    udpLatencyNormal: 'UDP Server: Latency normal.',
+    udpHighLatency: 'Audio server: playback backlog is high!',
+    udpLatencyNormal: 'Audio server: playback backlog is back to normal.',
     rtmpErrorTitle: 'RTMP Server Error',
     rtmpStartFailed: 'Failed to start RTMP Server. Please check if the port is already in use or if there are permission issues.',
   },
@@ -241,12 +241,12 @@ ipcMain.handle('start-udp-server', (_, config) => {
   const dropBaselineMs = typeof config.dropBaselineMs === 'number' && !isNaN(config.dropBaselineMs)
     ? Math.max(0, config.dropBaselineMs) : 0;
   const protectMs = typeof config.protectMs === 'number' && !isNaN(config.protectMs)
-    ? config.protectMs : null;
+    ? Math.max(0, config.protectMs) : null;
 
   if (dropBaselineMs > 0) {
     args.push('--drop-baseline-duration-ms', dropBaselineMs.toString());
-    if (protectMs != null) args.push('--protect-ms', protectMs.toString());
   }
+  if (protectMs != null) args.push('--protect-ms', protectMs.toString());
 
   udpServer = spawn(serverPath, args, {cwd: path.dirname(serverPath)});
 

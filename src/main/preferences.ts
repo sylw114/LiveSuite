@@ -37,9 +37,9 @@ export function createDefaultPreferences(language: AppLanguage = 'en'): UserPref
       transport: 'quic',
       tcpPort: 9000,
       audioPort: 9000,
-      discardOutOfOrder: true,
-      dropBaselineMs: 0,
-      protectMs: 50,
+      discardOutOfOrder: false,
+      dropBaselineMs: 200,
+      protectMs: 12,
     },
     video: {
       quicPort: 1935,

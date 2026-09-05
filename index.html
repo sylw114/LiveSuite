@@ -99,24 +99,24 @@
           </div>
           <div class="switch-field udp-audio-only">
             <label class="switch-label" for="discardOrder">
-              <input type="checkbox" id="discardOrder" checked>
-              <span data-i18n="discardOutOfOrder">Discard Out-of-Order</span>
+              <input type="checkbox" id="discardOrder">
+              <span data-i18n="discardOutOfOrder">Skip Reordering Wait</span>
             </label>
             <button class="btn-help" onclick="showHelp('discardHelp')" data-i18n-title="discardHelpTitle" data-i18n-aria-label="discardHelpTitle">?</button>
           </div>
           <div class="field">
             <div class="field-label-row">
-              <label class="field-label" for="dropBaselineMs" data-i18n="dropBaselineMs">Drop Baseline (ms)</label>
+              <label class="field-label" for="dropBaselineMs" data-i18n="dropBaselineMs">Catch-up Baseline (ms)</label>
               <button class="btn-help" onclick="showHelp('dropBaselineHelp')" data-i18n-title="dropBaselineHelpTitle" data-i18n-aria-label="dropBaselineHelpTitle">?</button>
             </div>
-            <input type="number" id="dropBaselineMs" value="0" min="0" max="60000" inputmode="numeric">
+            <input type="number" id="dropBaselineMs" value="200" min="0" max="60000" inputmode="numeric">
           </div>
           <div class="field">
             <div class="field-label-row">
-              <label class="field-label" for="protectMs" data-i18n="protectMs">Protect (ms)</label>
+              <label class="field-label" for="protectMs" data-i18n="protectMs">Jitter Buffer Floor (ms)</label>
               <button class="btn-help" onclick="showHelp('protectHelp')" data-i18n-title="protectHelpTitle" data-i18n-aria-label="protectHelpTitle">?</button>
             </div>
-            <input type="number" id="protectMs" value="50" min="0" max="60000" inputmode="numeric">
+            <input type="number" id="protectMs" value="12" min="0" max="60000" inputmode="numeric">
           </div>
         </div>
         <div class="actions">
@@ -168,21 +168,21 @@
         lowLatencyAudioServer: '低延迟音频服务器',
         audioTransport: '传输协议',
         audioPort: '音频端口',
-        tcpPort: 'TCP 端口',
-        udpPort: 'UDP 端口',
-        discardOutOfOrder: '丢弃乱序包',
-        discardHelpTitle: '丢弃乱序包说明',
-        discardHelp: '此选项可降低音频延迟。启用后，音频质量受丢包影响较小，但对乱序包更敏感。建议启用，除非客户端正在使用三包传输。',
-        dropBaselineMs: '丢弃率基准延迟',
-        dropBaselineHelpTitle: '丢弃率基准延迟说明',
-        dropBaselineHelp: '自适应丢包的基准延迟（毫秒）。值越小丢包越激进。设为 0 可禁用自适应丢弃。',
-        protectMs: '保护延迟',
-        protectHelpTitle: '保护延迟说明',
-        protectHelp: '缓存音频低于此阈值时不会丢包（毫秒）。值越高音频越平滑但延迟越高。',
+        tcpPort: 'TCP 控制端口',
+        udpPort: 'UDP 数据端口',
+        discardOutOfOrder: '不等待乱序包',
+        discardHelpTitle: '乱序等待说明',
+        discardHelp: '仅 UDP 模式有效。关闭时会短暂等待缺失序号（默认最长一个帧长，播放余量不足时提前结束），再用丢包隐藏继续播放；开启后不等待，立即隐藏缺口。默认关闭，通常更利于保持连续播放。',
+        dropBaselineMs: '追赶基准（ms）',
+        dropBaselineHelpTitle: '追赶基准说明',
+        dropBaselineHelp: '控制缓冲积压时的无变调追赶强度：抖动缓冲下限以上达到此余量时会逐步接近最大追赶速率。默认 200 ms；填 0 使用默认值。它不代表丢包比例或丢包开关。',
+        protectMs: '抖动缓冲下限（ms）',
+        protectHelpTitle: '抖动缓冲下限说明',
+        protectHelp: '播放端尽量保留的最小可播放余量。余量低于该值的 60% 时会适度减速保护，过低可能重新预缓冲。默认 12 ms；值越高通常越稳定但延迟越大。',
         start: '启动',
         stop: '停止',
         lowLatencyServer: 'LiveSuite 低延迟视频服务器',
-        lowLatencyDescription: 'LiveSuite 专属的通用视频传输。优先使用 QUIC 数据报；原生 UDP 使用相同媒体分片，作为低延迟回退。',
+        lowLatencyDescription: 'LiveSuite 专属的通用视频传输。QUIC 可靠流为主；原生 UDP 使用相同媒体分片，作为低延迟回退。',
         quicPort: 'QUIC 端口',
         udpFallbackPort: 'UDP 回退端口',
         httpOutputPort: 'HTTP 输出端口',
@@ -219,8 +219,6 @@
         encodeAverage: '平均编码耗时',
         encodeP95: '编码耗时 P95',
         clockRtt: '时钟同步 RTT',
-        packetLoss: 'FEC 后残余丢片',
-        recovered: 'FEC 重建分片',
         dropped: '丢弃帧',
         streamRate: '接收速率',
         pushAddressesTitle: 'LiveSuite 推流地址',
@@ -265,17 +263,17 @@
         lowLatencyAudioServer: 'Low-Latency Audio Server',
         audioTransport: 'Transport',
         audioPort: 'Audio Port',
-        tcpPort: 'TCP Port',
-        udpPort: 'UDP Port',
-        discardOutOfOrder: 'Discard Out-of-Order',
-        discardHelpTitle: 'Discard out-of-order help',
-        discardHelp: 'This reduces audio latency. When enabled, audio quality is less affected by packet loss but more sensitive to out-of-order packets. Recommended: enable this unless the client is using triple-packet transmission.',
-        dropBaselineMs: 'Drop Baseline (ms)',
-        dropBaselineHelpTitle: 'Drop baseline help',
-        dropBaselineHelp: 'Baseline latency for adaptive packet dropping (ms). Lower values make dropping more aggressive. Set to 0 to disable adaptive dropping.',
-        protectMs: 'Protect (ms)',
-        protectHelpTitle: 'Protect delay help',
-        protectHelp: 'No packets are dropped when cached audio is below this threshold (ms). Higher values give smoother audio but higher latency.',
+        tcpPort: 'TCP Control Port',
+        udpPort: 'UDP Data Port',
+        discardOutOfOrder: 'Skip Reordering Wait',
+        discardHelpTitle: 'Reordering wait help',
+        discardHelp: 'UDP mode only. When off, the server briefly waits for missing sequence numbers (up to one frame by default, or less when playback headroom is low), then conceals the gap. When on, it conceals gaps immediately. Off is the default and usually gives smoother playback.',
+        dropBaselineMs: 'Catch-up Baseline (ms)',
+        dropBaselineHelpTitle: 'Catch-up baseline help',
+        dropBaselineHelp: 'Controls pitch-preserving catch-up when buffered audio grows above the jitter-buffer floor. The default 200 ms determines how quickly playback approaches the maximum catch-up rate. Set to 0 to use the default; this is not a packet-loss setting.',
+        protectMs: 'Jitter Buffer Floor (ms)',
+        protectHelpTitle: 'Jitter buffer floor help',
+        protectHelp: 'Minimum playback headroom the renderer tries to retain. Below 60% of this floor it slows down to protect continuity and may rebuffer if input stops. Default 12 ms; higher values are smoother but add latency.',
         start: 'Start',
         stop: 'Stop',
         lowLatencyServer: 'LiveSuite Low-Latency Video Server',
@@ -316,8 +314,6 @@
         encodeAverage: 'Average encode time',
         encodeP95: 'Encode time P95',
         clockRtt: 'Clock sync RTT',
-        packetLoss: 'Residual loss after FEC',
-        recovered: 'FEC fragments rebuilt',
         dropped: 'Dropped frames',
         streamRate: 'Receive rate',
         pushAddressesTitle: 'LiveSuite Push Addresses',
@@ -723,19 +719,18 @@
       }
       clearWarning();
 
-      const rawDropBaseline = Math.max(0, parseInt(document.getElementById('dropBaselineMs').value, 10) || 0);
+      const parsedDropBaseline = parseInt(document.getElementById('dropBaselineMs').value, 10);
+      const rawDropBaseline = Number.isNaN(parsedDropBaseline) ? 200 : Math.max(0, parsedDropBaseline);
       const parsedProtect = parseInt(document.getElementById('protectMs').value, 10);
-      const rawProtect = Number.isNaN(parsedProtect) ? 50 : Math.max(0, parsedProtect);
+      const rawProtect = Number.isNaN(parsedProtect) ? 12 : Math.max(0, parsedProtect);
       const config = {
           transport: transport,
           tcpPort: tcpPort,
           udpPort: udpPort,
           discardOutOfOrder: document.getElementById('discardOrder').checked,
+          dropBaselineMs: rawDropBaseline,
+          protectMs: rawProtect,
       };
-      if (rawDropBaseline > 0) {
-          config.dropBaselineMs = rawDropBaseline;
-          config.protectMs = rawProtect;
-      }
       try {
         await persistPreferencesNow();
         await window.api.startUdpServer(config);
@@ -930,8 +925,6 @@
         appendMetric(grid, t('encodeP95'), formatMs(metrics.encodeP95Ms));
         appendMetric(grid, t('clockRtt'), formatMs(metrics.clockRttMs));
         appendMetric(grid, t('streamRate'), formatRate(metrics));
-        appendMetric(grid, t('packetLoss'), formatPercent(metrics.packetLossRatio));
-        appendMetric(grid, t('recovered'), String(metrics.recoveredFragments || 0));
         appendMetric(grid, t('dropped'), String(metrics.droppedFrames || 0));
         if (session.recordingPath || metrics.recordingPath) {
           appendMetric(grid, t('recordingFile'), session.recordingPath || metrics.recordingPath);
