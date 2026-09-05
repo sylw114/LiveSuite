@@ -1,7 +1,7 @@
 {
   "name": "livesuite",
   "productName": "LiveSuite",
-  "version": "2.1.4",
+  "version": "2.1.5",
   "main": "tscdist/main/index.js",
   "scripts": {
     "start": "electron .",
