@@ -213,7 +213,7 @@ assert.match(
     audioGroupDurationUs: 40_000,
   });
   let ended = 0;
-  reconnectHub.sessions.get('old-session').connections.add({ push() { ended++; } });
+  reconnectHub.sessions.get('old-session').connections.add({ pushFrames() { ended++; } });
   reconnectHub.registerSession({
     sessionId: 'new-session',
     streamPath: '/reconnected',
@@ -308,5 +308,65 @@ assert.strictEqual(
   hub.acceptPlaybackFeedback(liveFeedback(44, SLOW_PLAYBACK_RATE)).playbackRate,
   SLOW_PLAYBACK_RATE + MAX_PLAYBACK_RATE_STEP,
 );
+
+// Synchronized playback uses one clock and one buffer controller. Both audio
+// and video can be the limiting track, including a stream without audio.
+{
+  const sharedHub = new QuicPullHub({
+    takeFrames: () => ({ resync: false, closed: false, frames: [] }),
+    syncInfoJson: () => JSON.stringify({ synchronize: true, alignmentDelayMs: 250, alignmentReady: true }),
+  }, { bind: '127.0.0.1', port: 0 });
+  for (const streamPath of ['/pad/stream', '/phone/stream']) {
+    sharedHub.registerSession({ sessionId: streamPath, streamPath,
+      audioAvailable: streamPath === '/pad/stream', audioChannels: 2, audioGroupDurationUs: 40_000 });
+    sharedHub.sessions.get(streamPath).connections.add({ pushFrames() {}, close() {} });
+  }
+  sharedHub.refreshOriginServerMs();
+  const sharedFeedback = (streamPath, overrides = {}) => ({
+    ...liveFeedback(0), clientId: streamPath, streamPath,
+    hasAudio: streamPath === '/pad/stream', videoGapCount: 4,
+    requiredAlignmentDelayMs: 0, ...overrides,
+  });
+  const initial = sharedHub.acceptPlaybackFeedback(sharedFeedback('/phone/stream')).sharedPlaybackClock;
+  sharedHub.acceptPlaybackFeedback(sharedFeedback('/pad/stream', { audioBufferedMs: 0 }));
+  const audioLimited = sharedHub.updateSharedPlaybackClock(true, initial.anchorServerMs + 250);
+  assert.strictEqual(sharedHub.sharedPlaybackControl.reason, 'underflow');
+  assert.ok(audioLimited.playbackRate < 1, 'the audio-starved stream must slow the entire group');
+  const phoneControl = sharedHub.acceptPlaybackFeedback(sharedFeedback('/phone/stream'));
+  const padControl = sharedHub.acceptPlaybackFeedback(sharedFeedback('/pad/stream', {
+    audioBufferedMs: 0, requiredAlignmentDelayMs: 900,
+  }));
+  assert.deepStrictEqual(phoneControl.sharedPlaybackClock, padControl.sharedPlaybackClock);
+  assert.strictEqual(phoneControl.desiredPlaybackRate, padControl.desiredPlaybackRate);
+  assert.strictEqual(sharedHub.browserAlignmentDelayMs(), 900);
+  assert.strictEqual(sharedHub.updateSharedPlaybackClock(true, audioLimited.anchorServerMs + 20).revision,
+    audioLimited.revision, 'extra clients must not accelerate the controller update cadence');
+
+  sharedHub.acceptPlaybackFeedback(sharedFeedback('/pad/stream', { audioBufferedMs: 200 }));
+  sharedHub.acceptPlaybackFeedback(sharedFeedback('/phone/stream', {
+    videoGapCount: 0, videoBufferBytes: 0, requiredAlignmentDelayMs: 1200,
+  }));
+  const videoLimited = sharedHub.updateSharedPlaybackClock(true, audioLimited.anchorServerMs + 250);
+  assert.strictEqual(sharedHub.sharedPlaybackControl.reason, 'underflow');
+  assert.ok(videoLimited.playbackRate < audioLimited.playbackRate,
+    'the video-only stream must also be able to constrain the group');
+  assert.strictEqual(sharedHub.browserAlignmentDelayMs(), 1200);
+  assert.strictEqual(videoLimited.anchorPositionUs,
+    audioLimited.anchorPositionUs + 250 * audioLimited.playbackRate * 1000,
+    'a single low-watermark report must not immediately rewind the common clock');
+  const sameBudget = sharedHub.updateSharedPlaybackClock(true, videoLimited.anchorServerMs + 250);
+  assert.strictEqual(sameBudget.anchorPositionUs,
+    videoLimited.anchorPositionUs + 250 * videoLimited.playbackRate * 1000,
+    'rate changes with the same budget must preserve media position continuity');
+
+  // Timing out feedback removes its buffer reservation but cannot rewind or
+  // jump the clock while its HTTP players are still connected.
+  for (const entry of sharedHub.playbackFeedback.values()) entry.updatedAtMs = Date.now() - 10_000;
+  const afterTimeout = sharedHub.updateSharedPlaybackClock(true, sameBudget.anchorServerMs + 4000);
+  assert.strictEqual(sharedHub.browserAlignmentDelayMs(), 250);
+  assert.strictEqual(afterTimeout.anchorPositionUs,
+    sameBudget.anchorPositionUs + 4000 * sameBudget.playbackRate * 1000);
+  assert.strictEqual(afterTimeout.id, initial.id);
+}
 
 console.log('QUIC playback control tests passed');

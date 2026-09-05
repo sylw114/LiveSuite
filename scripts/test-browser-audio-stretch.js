@@ -205,15 +205,15 @@ for (const rate of [0.97, 1.03, 0.99, 1.01]) {
 {
   assert.strictEqual(helpers.audioSyncDeviationStep({ errorMs: 1.5, deviation: 0 }), 0);
   let deviation = 0;
-  for (let step = 0; step < 100; step++) deviation = helpers.audioSyncDeviationStep({ errorMs: 60, deviation });
+  for (let step = 0; step < 200; step++) deviation = helpers.audioSyncDeviationStep({ errorMs: 60, deviation });
   assert.ok(Math.abs(deviation + helpers.AUDIO_SYNC_MAX_DEVIATION) < 1e-9,
     'audio far ahead must slow by the maximum deviation only');
   assert.ok(helpers.AUDIO_SYNC_MAX_DEVIATION <= 0.01, 'local corrections must stay inaudible');
   deviation = 0;
   const first = helpers.audioSyncDeviationStep({ errorMs: -60, deviation });
-  assert.ok(Math.abs(first - 0.0005) < 1e-9, 'a single update may only move the deviation by one slew step');
+  assert.ok(Math.abs(first - 0.00004) < 1e-9, '20ms may only change tempo by 0.004%');
   for (let step = 0; step < 100; step++) deviation = helpers.audioSyncDeviationStep({ errorMs: -10, deviation });
-  assert.ok(Math.abs(deviation - 8 / 3000) < 1e-9, 'small errors converge to a proportional deviation');
+  assert.ok(Math.abs(deviation - 4 / 5000) < 1e-9, 'small errors converge to a proportional deviation');
   // A starving FIFO cannot be caught up by playing faster: speed-ups are
   // withheld (and an existing speed-up is wound down) until reserve returns.
   deviation = 0.004;
@@ -223,6 +223,15 @@ for (const rate of [0.97, 1.03, 0.99, 1.01]) {
   assert.strictEqual(deviation, 0, 'no speed-up while the FIFO has no reserve');
   assert.ok(helpers.audioSyncDeviationStep({ errorMs: 60, deviation: 0, allowFaster: false }) < 0,
     'slowing down remains allowed without reserve');
+  const ramp = (elapsedMs) => {
+    let value = 0;
+    for (let elapsed = 0; elapsed < 1000; elapsed += elapsedMs) {
+      value = helpers.audioSyncDeviationStep({ errorMs: 60, deviation: value, elapsedMs });
+    }
+    return value;
+  };
+  assert.ok(Math.abs(ramp(10) - ramp(20)) < 1e-9,
+    'sample rate and status callback frequency must not change tempo slew');
 }
 
 // Enqueue policy: contiguous streams append; an empty FIFO or a discontinuity

@@ -3,6 +3,7 @@ node_modules/
 /native/livesuite-quic/target/
 /quic-recordings/
 /tmp-quic-longrun/
+/tmp-quic-playback-observation/
 package-lock.json
 
 # Build Output

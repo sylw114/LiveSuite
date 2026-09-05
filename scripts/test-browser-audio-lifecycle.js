@@ -79,8 +79,8 @@ assert.match(videoRecovery, /this\.closeVideoDecoder\(\)/);
 assert.ok(!/closeAudioDecoder|resetAudioTimeline|abortController/.test(videoRecovery),
   'video backlog recovery must not interrupt already queued audio');
 const metrics = method('playbackMetrics()', '\n      async sendPlaybackFeedback() {');
-assert.match(metrics, /EXTRA_LATENT_MS \+ this\.adaptiveLatentMs/,
-  'the adaptive playback delay must be reported like the page latent so the server does not fight it');
+assert.match(metrics, /EXTRA_LATENT_MS \+ \(synchronizeEnabled \? 0 : this\.adaptiveLatentMs\)/,
+  'synchronized playback must not conceal a local drift as an intentional page delay');
 const audioTarget = method('audioTargetUs(nowPerfMs = performance.now())', '\n      destroyAudioOutput() {');
 assert.match(audioTarget, /this\.displayLagMs/, 'audio follows the actually presented video');
 
@@ -277,6 +277,33 @@ const lastStatus = processor.port.posted[processor.port.posted.length - 1];
 assert.strictEqual(lastStatus.type, 'status');
 for (const field of ['contextTime', 'consumedFrames', 'queuedFrames', 'underrunFrames', 'underruns', 'flushes', 'renderedFrames', 'starving']) {
   assert.ok(field in lastStatus, `status must report ${field}`);
+}
+
+// A shared buffer increase pauses PCM consumption without discarding any
+// samples. The same worklet implementation is used by the script fallback.
+{
+  const held = new Processor();
+  held.handleMessage({ type: 'configure', statusInterval: 1 });
+  held.handleMessage({ type: 'push', frames: 384,
+    planes: [new Float32Array(384).fill(0.5), new Float32Array(384).fill(-0.5)] });
+  held.handleMessage({ type: 'hold', frames: 256 });
+  for (let index = 0; index < 2; index++) {
+    const output = quantum();
+    held.process([], output);
+    assert.ok(output[0].every((channel) => channel.every((value) => value === 0)));
+    assert.strictEqual(held.consumedFrames, 0);
+    assert.strictEqual(held.queuedFrames, 384);
+  }
+  const resumed = quantum();
+  held.process([], resumed);
+  assert.ok(resumed[0][0][127] > 0.45);
+  assert.strictEqual(held.consumedFrames, 128);
+  assert.strictEqual(held.queuedFrames, 256);
+  assert.strictEqual(held.underruns, 0);
+  held.handleMessage({ type: 'hold', frames: 512 });
+  held.handleMessage({ type: 'flush' });
+  assert.strictEqual(held.holdFrames, 0);
+  assert.strictEqual(held.holdFramesRequested, 0);
 }
 
 console.log('Browser audio lifecycle tests passed');

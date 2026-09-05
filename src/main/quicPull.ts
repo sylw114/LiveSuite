@@ -8,6 +8,7 @@
 //   同时避免音视频轨道互相等待后成批释放。
 import http from 'http';
 import fs from 'fs';
+import { randomUUID } from 'crypto';
 
 // 帧类型常量,与 Rust `frame_hub.rs` 保持一致。
 export const RAW_VIDEO_CONFIG = 1;
@@ -22,6 +23,13 @@ const MAX_QUEUED_FRAMES = 512;
 const FLV_TIMESTAMP_MODULUS_MS = 0x1_0000_0000;
 const PLAYBACK_FEEDBACK_PATH = '/livesuite/playback-feedback';
 const PLAYBACK_FEEDBACK_TTL_MS = 2_500;
+const SHARED_PLAYBACK_CONTROL_INTERVAL_MS = 250;
+const SHARED_RATE_MAX_DEVIATION = 0.005;
+const SHARED_RATE_STEP = 0.0005;
+const SHARED_REBUFFER_MIN_DEFICIT_MS = 100;
+const SHARED_REBUFFER_CONFIRM_MS = SHARED_PLAYBACK_CONTROL_INTERVAL_MS * 2;
+const SHARED_STARTUP_MAX_LAG_MS = 1000;
+const SHARED_STARTUP_RECOVERY_CONFIRM_MS = 300;
 const DEFAULT_ALIGNMENT_DELAY_MS = 180;
 const MAX_REPORTED_POSITION_US = Number.MAX_SAFE_INTEGER;
 const MAX_REPORTED_CLOCK_MS = Number.MAX_SAFE_INTEGER;
@@ -57,6 +65,7 @@ export const MAX_PLAYBACK_RATE_STEP = 0.002;
 
 export interface PlaybackFeedback {
   clientId: string;
+  playerBuildId?: string;
   sessionId: string;
   streamPath: string;
   videoBufferBytes: number;
@@ -64,9 +73,20 @@ export interface PlaybackFeedback {
   audioFrameCount: number;
   /** 做了 Web Audio 实际排程时长上报，以防止出现只按音频帧数误判水位的情况。 */
   audioBufferedMs?: number | null;
+  /** 浏览器持续缺少音视频处理余量时请求的公共播放延迟，不是单路偏移。 */
+  requiredAlignmentDelayMs?: number | null;
+  audioRequiredAlignmentDelayMs?: number | null;
+  videoRequiredAlignmentDelayMs?: number | null;
+  alignmentRequest?: AlignmentRequestObservation | null;
   hasAudio: boolean;
   /** 已补回浏览器页面额外 latent 的服务端时间轴播放位置。 */
   playbackPositionUs: number | null;
+  /** 当前音频时间轴是否已有实际出声位置；视频尚未起播也不能打断声音。 */
+  audioPlaybackStarted?: boolean;
+  audioPlaybackPositionUs?: number | null;
+  /** 所有必要轨道共同覆盖的可播放范围，已补回页面额外延迟。 */
+  bufferedStartUs?: number | null;
+  bufferedEndUs?: number | null;
   /**
    * 浏览器已接受的主播放时钟速率，用于控制响应确认和丢包后的补发。
    */
@@ -74,6 +94,39 @@ export interface PlaybackFeedback {
   /** 浏览器 performance 时钟映射到服务端墙钟后的值,与 latent 无关。 */
   playbackClockMs: number | null;
   updatedAtMs: number;
+}
+
+interface AlignmentRequestObservation {
+  track: 'audio' | 'video';
+  deltaMs: number | null;
+  actualDelayMs: number | null;
+  requestedDelayMs: number | null;
+  clockRevision: number | null;
+  audioArrivalLeadMs: number | null;
+  audioRequiredLeadMs: number | null;
+  audioDecodeLatencyMs: number | null;
+  videoDecodeLeadMs: number | null;
+}
+
+interface ObservedPlaybackFeedback extends PlaybackFeedback {
+  videoUnderflowSinceMs: number | null;
+  audioUnderflowSinceMs: number | null;
+  videoProgressAtMs: number;
+  audioProgressAtMs: number;
+}
+
+interface RebufferObservation {
+  atMs: number;
+  streamPath: string;
+  clientId: string;
+  track: 'video' | 'audio';
+  missingForMs: number;
+  actualDelayMs: number;
+  requiredDelayMs: number;
+  heldMs: number;
+  videoGapCount: number;
+  audioBufferedMs: number | null;
+  alignmentRequest: AlignmentRequestObservation | null;
 }
 
 export type PlaybackControlReason =
@@ -96,11 +149,27 @@ export interface PlaybackRateState {
   reason: PlaybackControlReason;
 }
 
+interface SharedPlaybackClock {
+  id: string;
+  alignmentDelayMs: number;
+  revision: number;
+  anchorServerMs: number;
+  anchorPositionUs: number;
+  playbackRate: number;
+  /** 仅累计明确的公共重新蓄水量，客户端不能把漏收校速响应误判成暂停。 */
+  rebufferedUs: number;
+  /** 整组尚未起播且旧时钟已不可用时，共同重新定位；不能当作音频暂停。 */
+  startupRecoveryRevision: number;
+  /** 曾经播放过但整组已停滞、旧位置不在缓冲内时的公共向前恢复。 */
+  stalledRecoveryRevision: number;
+}
+
 interface PlaybackControlResponse extends Omit<PlaybackControl, 'playbackRate'> {
   /** 做了仅在速率变化时下发字段，以防止出现无变化时重复触发播放端控速的情况。 */
   playbackRate?: number;
   /** 当前服务端计算出的目标速率，仅用于诊断。 */
   desiredPlaybackRate: number;
+  sharedPlaybackClock?: SharedPlaybackClock | null;
 }
 
 /**
@@ -125,29 +194,24 @@ export function evaluatePlaybackControl(
     entry,
     alignmentDelayMs,
     nowMs,
-    // 做了单播放端才传入历史状态的限制，以防止出现多路客户端的滞回状态串扰的情况。
-    feedback.length === 1 ? previousState : undefined,
+    // 聚合控制使用同一历史状态：最慢音频或视频轨限制整个同步播放组。
+    previousState,
   ));
   if (controls.length === 1) {
     return controls[0];
   }
   const firstNonSteady = controls.find((control) => control.reason !== 'steady');
   if (firstNonSteady) {
-    // 这个聚合结果只作为未携带 clientId 的兼容回退;正常页面会拿到
-    // 自己对应的控制,不会因为另一路流漂移而一起改变速度。
+    // 任意音频或视频不足都优先限制公共速率，不能被另一条快流的余量抵消。
     const slowest = controls
       .filter((control) => control.playbackRate < NORMAL_PLAYBACK_RATE)
       .sort((left, right) => left.playbackRate - right.playbackRate)[0];
     if (slowest) {
       return slowest;
     }
-    const fastest = controls
-      .filter((control) => control.playbackRate > NORMAL_PLAYBACK_RATE)
-      .sort((left, right) => right.playbackRate - left.playbackRate)[0];
-    if (fastest) {
-      return fastest;
-    }
-    return firstNonSteady;
+    // 加速也必须得到最慢轨的允许，不能用最快页面的高水位催快整组。
+    return controls.reduce((slowest, control) => control.playbackRate < slowest.playbackRate
+      ? control : slowest);
   }
 
   return steadyPlaybackControl();
@@ -244,6 +308,49 @@ function hasAudioReserveFor(
     return scheduledMs >= bufferedMs;
   }
   return feedback.audioFrameCount >= frameCount;
+}
+
+function hasVideoReserveFor(feedback: PlaybackFeedback): boolean {
+  return feedback.videoBufferBytes >= MIN_VIDEO_BUFFER_BYTES
+    || feedback.videoGapCount >= MIN_VIDEO_GAP_COUNT;
+}
+
+/** 公共时钟自身没有离散视频 PTS 的量化误差，只根据最慢轨水位平滑蓄水/回收。 */
+export function evaluateSharedPlaybackControl(
+  feedback: readonly PlaybackFeedback[],
+  positionUs: number,
+  alignmentDelayMs: number,
+  nowMs: number,
+  previousState?: PlaybackRateState,
+): PlaybackControl {
+  const targetPositionUs = (nowMs - alignmentDelayMs) * 1000;
+  const positionErrorMs = (positionUs - targetPositionUs) / 1000;
+  const underflow = feedback.some((entry) => !hasVideoReserveFor(entry)
+    || !hasAudioReserveFor(entry, MIN_AUDIO_FRAME_COUNT,
+      previousState?.reason === 'underflow' ? RELEASE_AUDIO_BUFFER_MS : MIN_AUDIO_BUFFER_MS));
+  const canAccelerate = feedback.length > 0 && feedback.every((entry) =>
+    hasVideoReserveFor(entry)
+    && hasAudioReserveFor(entry, MIN_AUDIO_FRAME_COUNT, RELEASE_AUDIO_BUFFER_MS));
+  let reason: PlaybackControlReason = 'steady';
+  let desiredRate = NORMAL_PLAYBACK_RATE;
+  if (underflow) {
+    reason = 'underflow';
+    desiredRate -= SHARED_RATE_MAX_DEVIATION;
+  } else if (feedback.length > 0 && positionErrorMs > 8) {
+    reason = 'ahead';
+    desiredRate -= Math.min(SHARED_RATE_MAX_DEVIATION, (positionErrorMs - 8) / 10_000);
+  } else if (canAccelerate && positionErrorMs < -20) {
+    reason = 'behind';
+    desiredRate += Math.min(SHARED_RATE_MAX_DEVIATION, (-positionErrorMs - 20) / 10_000);
+  }
+  const previousRate = previousState?.playbackRate ?? NORMAL_PLAYBACK_RATE;
+  return {
+    playbackRate: Math.round((previousRate + Math.max(-SHARED_RATE_STEP,
+      Math.min(SHARED_RATE_STEP, desiredRate - previousRate))) * 1_000_000) / 1_000_000,
+    reason,
+    targetPositionUs,
+    positionErrorMs,
+  };
 }
 
 function targetPlaybackPosition(
@@ -360,7 +467,7 @@ class PullConnection {
   private frames: OutputFrame[] = [];
   private waiter: ((frame: OutputFrame | null) => void) | null = null;
   private closed = false;
-  lastOrdinal = 0;
+  private lastQueuedOrdinal = 0;
   timeline: FlvTimeline;
   pending: OutputFrame[] = [];
 
@@ -380,23 +487,30 @@ class PullConnection {
     return this.session.audioChannels;
   }
 
-  push(frame: OutputFrame): void {
+  pushFrames(frames: readonly OutputFrame[]): void {
     if (this.closed) {
       return;
     }
-    if (frame.ordinal <= this.lastOrdinal) {
-      return;
-    }
-    if (this.waiter) {
-      const waiter = this.waiter;
-      this.waiter = null;
-      waiter(frame);
-      return;
-    }
-    this.frames.push(frame);
-    if (this.frames.length > MAX_QUEUED_FRAMES) {
-      // 拉流端消费太慢:断开让其重连,避免内存无限增长并拖慢整体轮询。
-      this.close();
+    // 快照先给配置，再按媒体时间给 GOP；其 ordinal 并不递增（例如音频
+    // 配置早于最新视频配置）。整批只和上一批的水位去重，保留批内原顺序。
+    const previousOrdinal = this.lastQueuedOrdinal;
+    for (const frame of frames) {
+      if (frame.ordinal <= previousOrdinal) {
+        continue;
+      }
+      this.lastQueuedOrdinal = Math.max(this.lastQueuedOrdinal, frame.ordinal);
+      if (this.waiter) {
+        const waiter = this.waiter;
+        this.waiter = null;
+        waiter(frame);
+      } else {
+        this.frames.push(frame);
+        if (this.frames.length > MAX_QUEUED_FRAMES) {
+          // 拉流端消费太慢:断开让其重连,避免内存无限增长并拖慢整体轮询。
+          this.close();
+          return;
+        }
+      }
     }
   }
 
@@ -483,10 +597,6 @@ class PullConnection {
       if (frame == null) {
         continue;
       }
-      if (frame.ordinal <= this.lastOrdinal) {
-        continue;
-      }
-      this.lastOrdinal = frame.ordinal;
       if (frame.kind === RAW_END) {
         ended = true;
         continue;
@@ -580,9 +690,18 @@ export class QuicPullHub {
   private synchronizedPullStreams: boolean | null = null;
   private alignmentReady = false;
   private alignmentDelayMs = DEFAULT_ALIGNMENT_DELAY_MS;
-  private readonly playbackFeedback = new Map<string, PlaybackFeedback>();
+  private readonly playbackFeedback = new Map<string, ObservedPlaybackFeedback>();
   /** 做了每个浏览器的最近控速状态保存，以防止出现重复下发和纠偏滞回失效的情况。 */
   private readonly playbackRateStates = new Map<string, PlaybackRateState>();
+  private sharedPlaybackClock: SharedPlaybackClock | null = null;
+  private readonly sharedPlaybackClockId = randomUUID();
+  private sharedPlaybackClockRevision = 0;
+  private sharedPlaybackControlAtMs = 0;
+  private sharedStartupRecoverySinceMs: number | null = null;
+  private sharedRebufferUntilMs = 0;
+  private lastRebuffer: RebufferObservation | null = null;
+  private rebufferCount = 0;
+  private sharedPlaybackControl: PlaybackControl = steadyPlaybackControl();
   private playbackControl: PlaybackControl = {
     playbackRate: NORMAL_PLAYBACK_RATE,
     reason: 'steady',
@@ -647,6 +766,13 @@ export class QuicPullHub {
     this.sessions.clear();
     this.playbackFeedback.clear();
     this.playbackRateStates.clear();
+    this.sharedPlaybackClock = null;
+    this.sharedPlaybackControlAtMs = 0;
+    this.sharedStartupRecoverySinceMs = null;
+    this.sharedRebufferUntilMs = 0;
+    this.lastRebuffer = null;
+    this.rebufferCount = 0;
+    this.sharedPlaybackControl = steadyPlaybackControl();
     this.playbackControl = {
       playbackRate: NORMAL_PLAYBACK_RATE,
       reason: 'steady',
@@ -774,12 +900,12 @@ export class QuicPullHub {
       data: Buffer.alloc(0),
     };
     for (const connection of session.connections) {
-      connection.push(endFrame);
+      connection.pushFrames([endFrame]);
     }
   }
 
   /** 取出仍对应活跃 HTTP-FLV 连接的最新播放端反馈,并清理过期项。 */
-  private freshPlaybackFeedback(): PlaybackFeedback[] {
+  private freshPlaybackFeedback(): ObservedPlaybackFeedback[] {
     const now = epochMs();
     for (const [key, feedback] of this.playbackFeedback) {
       const session = this.sessions.get(feedback.sessionId);
@@ -795,13 +921,177 @@ export class QuicPullHub {
   private refreshPlaybackControl(): PlaybackControl {
     this.playbackControl = evaluatePlaybackControl(
       this.freshPlaybackFeedback(),
-      this.alignmentDelayMs,
+      this.browserAlignmentDelayMs(),
     );
     return this.playbackControl;
   }
 
+  /** 同步网页共享最慢音频或视频轨已确认的处理预算；失活反馈不再占用预算。 */
+  private browserAlignmentDelayMs(synchronized = this.synchronizedPullStreams === true): number {
+    let delayMs = this.alignmentDelayMs;
+    if (synchronized) {
+      for (const feedback of this.freshPlaybackFeedback()) {
+        if (feedback.requiredAlignmentDelayMs != null) {
+          delayMs = Math.max(delayMs, feedback.requiredAlignmentDelayMs);
+        }
+      }
+    }
+    return delayMs;
+  }
+
+  /** 同步组只有一个连续时钟。更新频率与客户端数量无关，所有页面外推同一锚点。 */
+  private updateSharedPlaybackClock(
+    synchronized = this.synchronizedPullStreams === true,
+    nowMs = epochMs(),
+  ): SharedPlaybackClock | null {
+    if (!synchronized) {
+      this.sharedPlaybackClock = null;
+      this.sharedStartupRecoverySinceMs = null;
+      this.sharedRebufferUntilMs = 0;
+      return null;
+    }
+    if (this.sharedPlaybackClock
+      && nowMs - this.sharedPlaybackControlAtMs < SHARED_PLAYBACK_CONTROL_INTERVAL_MS) {
+      return this.sharedPlaybackClock;
+    }
+    const feedback = this.freshPlaybackFeedback();
+    const delayMs = this.browserAlignmentDelayMs(true);
+    const previous = this.sharedPlaybackClock;
+    const activeSessions = [...this.sessions.values()].filter((session) => !session.closed
+      && session.connections.size > 0);
+    const active = activeSessions.length > 0;
+    let positionUs = previous && active
+      ? previous.anchorPositionUs + (nowMs - previous.anchorServerMs) * previous.playbackRate * 1000
+      : (nowMs - delayMs) * 1000;
+    let rebufferedUs = previous?.rebufferedUs ?? 0;
+    let startupRecoveryRevision = previous?.startupRecoveryRevision ?? 0;
+    let stalledRecoveryRevision = previous?.stalledRecoveryRevision ?? 0;
+    const targetPositionUs = (nowMs - delayMs) * 1000;
+    // 临时的大预算回落后，新页面可能只拿到当前 GOP，公共时钟却还落后
+    // 数十秒。仅靠 0.5% 校速会永久等不到首帧。整组都尚未呈现、每条必要
+    // 音视频轨已就绪并持续确认时统一恢复起播；任何已呈现页面都会否决。
+    const startupBlocked = this.alignmentReady && previous && feedback.length > 0
+      && (targetPositionUs - positionUs) / 1000 > SHARED_STARTUP_MAX_LAG_MS
+      && activeSessions.every((session) => feedback.some((entry) => entry.sessionId === session.sessionId))
+      && feedback.every((entry) => {
+        const session = this.sessions.get(entry.sessionId);
+        const needsAudio = session?.includeAudio && session.audioAvailable;
+        return entry.playbackPositionUs === null && entry.audioPlaybackStarted !== true
+          && hasVideoReserveFor(entry)
+          && (!needsAudio || entry.hasAudio)
+          && hasAudioReserveFor(entry, MIN_AUDIO_FRAME_COUNT, RELEASE_AUDIO_BUFFER_MS);
+      });
+    // 首帧状态是历史事实，不能用它永久否决故障恢复。整组当前已无实际
+    // 音视频进度且旧位置在缓存之前时，只有共同范围覆盖新目标才向前恢复。
+    const stalledRecoveryPositionUs = Math.min(targetPositionUs,
+      ...feedback.map((entry) => entry.bufferedEndUs ?? -Infinity));
+    const stalledBlocked = this.alignmentReady && previous && feedback.length > 0
+      && targetPositionUs - positionUs > SHARED_STARTUP_MAX_LAG_MS * 1000
+      && targetPositionUs - stalledRecoveryPositionUs < SHARED_STARTUP_MAX_LAG_MS * 1000
+      && activeSessions.every((session) => feedback.some((entry) => entry.sessionId === session.sessionId))
+      && feedback.every((entry) => {
+        const session = this.sessions.get(entry.sessionId);
+        const needsAudio = session?.includeAudio && session.audioAvailable;
+        return nowMs - entry.videoProgressAtMs >= SHARED_STARTUP_MAX_LAG_MS
+          && (!needsAudio || (entry.hasAudio
+            && nowMs - entry.audioProgressAtMs >= SHARED_STARTUP_MAX_LAG_MS))
+          && entry.bufferedStartUs != null && entry.bufferedEndUs != null
+          && entry.bufferedStartUs <= stalledRecoveryPositionUs && entry.bufferedEndUs >= stalledRecoveryPositionUs;
+      })
+      && feedback.some((entry) => entry.bufferedStartUs! - positionUs > SHARED_STARTUP_MAX_LAG_MS * 1000);
+    if (startupBlocked || stalledBlocked) {
+      this.sharedStartupRecoverySinceMs ??= nowMs;
+      if (nowMs - this.sharedStartupRecoverySinceMs >= SHARED_STARTUP_RECOVERY_CONFIRM_MS) {
+        positionUs = startupBlocked ? targetPositionUs : stalledRecoveryPositionUs;
+        if (startupBlocked) startupRecoveryRevision++;
+        else stalledRecoveryRevision++;
+        this.sharedRebufferUntilMs = 0;
+        this.sharedStartupRecoverySinceMs = null;
+      }
+    } else {
+      this.sharedStartupRecoverySinceMs = null;
+    }
+    const actualDelayMs = nowMs - positionUs / 1000;
+    let rebuffer: RebufferObservation | null = null;
+    for (const entry of feedback) {
+      for (const track of ['video', 'audio'] as const) {
+        const since = track === 'video' ? entry.videoUnderflowSinceMs : entry.audioUnderflowSinceMs;
+        if (since == null || since < this.sharedRebufferUntilMs
+          || entry.updatedAtMs - since < SHARED_REBUFFER_CONFIRM_MS) continue;
+        const trackDelayMs = track === 'video'
+          ? entry.videoRequiredAlignmentDelayMs : entry.audioRequiredAlignmentDelayMs;
+        // 旧页面只有合并预算时仍兼容；新页面必须由缺数据的同一轨申请。
+        const requiredDelayMs = Math.max(this.alignmentDelayMs,
+          trackDelayMs ?? entry.requiredAlignmentDelayMs ?? 0);
+        const heldMs = requiredDelayMs - actualDelayMs;
+        if (heldMs < SHARED_REBUFFER_MIN_DEFICIT_MS || heldMs <= (rebuffer?.heldMs ?? 0)) continue;
+        rebuffer = { atMs: nowMs, streamPath: entry.streamPath, clientId: entry.clientId,
+          track, missingForMs: entry.updatedAtMs - since, actualDelayMs, requiredDelayMs, heldMs,
+          videoGapCount: entry.videoGapCount, audioBufferedMs: entry.audioBufferedMs ?? null,
+          alignmentRequest: entry.alignmentRequest ?? null };
+      }
+    }
+    if (rebuffer) {
+      rebufferedUs += rebuffer.heldMs * 1000;
+      positionUs -= rebuffer.heldMs * 1000;
+      this.sharedRebufferUntilMs = nowMs + rebuffer.heldMs / (previous?.playbackRate ?? 1);
+      this.lastRebuffer = rebuffer;
+      this.rebufferCount++;
+      console.warn('[LiveSuite] shared playback rebuffer', JSON.stringify(rebuffer));
+    }
+    this.sharedPlaybackControl = evaluateSharedPlaybackControl(
+      feedback, positionUs, delayMs, nowMs, previous ? this.sharedPlaybackControl : undefined,
+    );
+    this.sharedPlaybackControlAtMs = nowMs;
+    this.sharedPlaybackClock = {
+      id: this.sharedPlaybackClockId,
+      alignmentDelayMs: delayMs,
+      revision: ++this.sharedPlaybackClockRevision,
+      anchorServerMs: nowMs,
+      // 反馈短暂超时只影响控速证据，不能重置仍在播放的组时钟。
+      anchorPositionUs: positionUs,
+      playbackRate: this.sharedPlaybackControl.playbackRate,
+      rebufferedUs,
+      startupRecoveryRevision,
+      stalledRecoveryRevision,
+    };
+    return this.sharedPlaybackClock;
+  }
+
   private feedbackKey(clientId: string, sessionId: string): string {
     return `${clientId}\u0000${sessionId}`;
+  }
+
+  /** 仅提供状态快照；观测不能续期反馈或改变公共时钟。 */
+  private playbackDiagnostics(): Record<string, unknown> {
+    const nowMs = epochMs();
+    const clock = this.sharedPlaybackClock;
+    const positionUs = clock ? clock.anchorPositionUs
+      + (nowMs - clock.anchorServerMs) * clock.playbackRate * 1000 : null;
+    return {
+      actualDelayMs: positionUs == null ? null : nowMs - positionUs / 1000,
+      targetDelayMs: clock?.alignmentDelayMs ?? this.alignmentDelayMs,
+      reason: this.sharedPlaybackControl.reason,
+      rebufferCount: this.rebufferCount,
+      rebufferRemainingMs: Math.max(0, this.sharedRebufferUntilMs - nowMs),
+      lastRebuffer: this.lastRebuffer,
+      clients: this.freshPlaybackFeedback().map((entry) => ({
+        clientId: entry.clientId, streamPath: entry.streamPath,
+        playerBuildId: entry.playerBuildId,
+        feedbackAgeMs: nowMs - entry.updatedAtMs,
+        videoGapCount: entry.videoGapCount, audioBufferedMs: entry.audioBufferedMs,
+        videoProgressAgeMs: nowMs - entry.videoProgressAtMs,
+        audioProgressAgeMs: entry.hasAudio ? nowMs - entry.audioProgressAtMs : null,
+        videoUnderflowMs: entry.videoUnderflowSinceMs == null ? 0 : entry.updatedAtMs - entry.videoUnderflowSinceMs,
+        audioUnderflowMs: entry.audioUnderflowSinceMs == null ? 0 : entry.updatedAtMs - entry.audioUnderflowSinceMs,
+        requiredAlignmentDelayMs: entry.requiredAlignmentDelayMs,
+        videoRequiredAlignmentDelayMs: entry.videoRequiredAlignmentDelayMs,
+        audioRequiredAlignmentDelayMs: entry.audioRequiredAlignmentDelayMs,
+        alignmentRequest: entry.alignmentRequest,
+        playbackPositionUs: entry.playbackPositionUs, audioPlaybackPositionUs: entry.audioPlaybackPositionUs,
+        bufferedStartUs: entry.bufferedStartUs, bufferedEndUs: entry.bufferedEndUs,
+      })),
+    };
   }
 
   /** 记录一个浏览器播放端的水位/时间轴位置并返回该路播放控制。 */
@@ -846,26 +1136,71 @@ export class QuicPullHub {
       return raw >= 0.9 && raw <= 1.1 ? raw : null;
     };
     const updatedAtMs = epochMs();
-    const feedback: PlaybackFeedback = {
+    const readAlignmentRequest = (): AlignmentRequestObservation | null => {
+      if (!body.alignmentRequest || typeof body.alignmentRequest !== 'object') return null;
+      const request = body.alignmentRequest as Record<string, unknown>;
+      if (request.track !== 'audio' && request.track !== 'video') return null;
+      const detail = (name: string): number | null => typeof request[name] === 'number'
+        && Number.isFinite(request[name]) ? request[name] as number : null;
+      return { track: request.track, deltaMs: detail('deltaMs'), actualDelayMs: detail('actualDelayMs'),
+        requestedDelayMs: detail('requestedDelayMs'), clockRevision: detail('clockRevision'),
+        audioArrivalLeadMs: detail('audioArrivalLeadMs'), audioRequiredLeadMs: detail('audioRequiredLeadMs'),
+        audioDecodeLatencyMs: detail('audioDecodeLatencyMs'), videoDecodeLeadMs: detail('videoDecodeLeadMs') };
+    };
+    const key = this.feedbackKey(clientId, session.sessionId);
+    const oldFeedback = this.playbackFeedback.get(key);
+    const previousFeedback = oldFeedback && updatedAtMs - oldFeedback.updatedAtMs <= PLAYBACK_FEEDBACK_TTL_MS
+      ? oldFeedback : undefined;
+    const feedback: ObservedPlaybackFeedback = {
       clientId,
+      playerBuildId: typeof body.playerBuildId === 'string' ? body.playerBuildId.slice(0, 64) : undefined,
       sessionId: session.sessionId,
       streamPath,
       videoBufferBytes: metric('videoBufferBytes', false),
       videoGapCount: metric('videoGapCount', true),
       audioFrameCount: metric('audioFrameCount', true),
       audioBufferedMs: nullableMetric('audioBufferedMs', 60_000),
+      requiredAlignmentDelayMs: nullableMetric('requiredAlignmentDelayMs', 60_000),
+      audioRequiredAlignmentDelayMs: nullableMetric('audioRequiredAlignmentDelayMs', 60_000),
+      videoRequiredAlignmentDelayMs: nullableMetric('videoRequiredAlignmentDelayMs', 60_000),
+      alignmentRequest: readAlignmentRequest(),
       hasAudio: body.hasAudio === true,
       playbackPositionUs: nullableMetric('playbackPositionUs', MAX_REPORTED_POSITION_US),
+      audioPlaybackStarted: body.audioPlaybackStarted === true,
+      audioPlaybackPositionUs: nullableMetric('audioPlaybackPositionUs', MAX_REPORTED_POSITION_US),
+      bufferedStartUs: nullableMetric('bufferedStartUs', MAX_REPORTED_POSITION_US),
+      bufferedEndUs: nullableMetric('bufferedEndUs', MAX_REPORTED_POSITION_US),
       appliedPlaybackRate: appliedPlaybackRate(),
       playbackClockMs: nullableMetric('playbackClockMs', MAX_REPORTED_CLOCK_MS),
       updatedAtMs,
+      videoUnderflowSinceMs: null,
+      audioUnderflowSinceMs: null,
+      videoProgressAtMs: updatedAtMs,
+      audioProgressAtMs: updatedAtMs,
     };
-    const key = this.feedbackKey(clientId, session.sessionId);
+    const videoProgressed = feedback.playbackPositionUs != null
+      && (previousFeedback?.playbackPositionUs == null || feedback.playbackPositionUs > previousFeedback.playbackPositionUs);
+    const audioProgressed = feedback.audioPlaybackPositionUs != null
+      && (previousFeedback?.audioPlaybackPositionUs == null || feedback.audioPlaybackPositionUs > previousFeedback.audioPlaybackPositionUs);
+    if (!videoProgressed) feedback.videoProgressAtMs = previousFeedback?.videoProgressAtMs ?? updatedAtMs;
+    if (!audioProgressed) feedback.audioProgressAtMs = previousFeedback?.audioProgressAtMs ?? updatedAtMs;
+    // 只累计新反馈中连续欠载且输出未前进的时间。轮询命中正常帧间空档、
+    // 恢复出声或旧反馈反复被读取，都不能成为公共暂停的证据。
+    if (updatedAtMs >= this.sharedRebufferUntilMs && !hasVideoReserveFor(feedback) && !videoProgressed) {
+      const since = previousFeedback?.videoUnderflowSinceMs;
+      feedback.videoUnderflowSinceMs = since != null && since >= this.sharedRebufferUntilMs ? since : updatedAtMs;
+    }
+    if (updatedAtMs >= this.sharedRebufferUntilMs
+      && !hasAudioReserveFor(feedback, MIN_AUDIO_FRAME_COUNT, MIN_AUDIO_BUFFER_MS) && !audioProgressed) {
+      const since = previousFeedback?.audioUnderflowSinceMs;
+      feedback.audioUnderflowSinceMs = since != null && since >= this.sharedRebufferUntilMs ? since : updatedAtMs;
+    }
     this.playbackFeedback.set(key, feedback);
     const previousState = this.playbackRateStates.get(key);
-    const control = evaluatePlaybackControl(
+    const sharedPlaybackClock = this.updateSharedPlaybackClock();
+    const control = sharedPlaybackClock ? this.sharedPlaybackControl : evaluatePlaybackControl(
       [feedback],
-      this.alignmentDelayMs,
+      this.browserAlignmentDelayMs(),
       updatedAtMs,
       previousState,
     );
@@ -887,13 +1222,14 @@ export class QuicPullHub {
     });
     this.playbackControl = evaluatePlaybackControl(
       this.freshPlaybackFeedback(),
-      this.alignmentDelayMs,
+      this.browserAlignmentDelayMs(),
       updatedAtMs,
     );
     return {
       ...control,
       desiredPlaybackRate: control.playbackRate,
       playbackRate,
+      sharedPlaybackClock,
     };
   }
 
@@ -923,17 +1259,9 @@ export class QuicPullHub {
         if (frame.ordinal > session.lastPolledOrdinal) {
           session.lastPolledOrdinal = frame.ordinal;
         }
-        const output: OutputFrame = {
-          ordinal: frame.ordinal,
-          kind: frame.kind,
-          ptsUs: frame.ptsUs,
-          timelineUs: frame.timelineUs,
-          releaseEpochMs: frame.releaseEpochMs,
-          data: frame.data,
-        };
-        for (const connection of session.connections) {
-          connection.push(output);
-        }
+      }
+      for (const connection of session.connections) {
+        connection.pushFrames(result.frames);
       }
       if (result.closed) {
         this.endSession(session);
@@ -1010,10 +1338,14 @@ export class QuicPullHub {
           this.alignmentDelayMs = Math.min(60_000, Math.max(0, info.alignmentDelayMs));
         }
         this.alignmentReady = info.synchronize !== true || info.alignmentReady !== false;
-        // 做了同步轮询与控速下发的职责拆分，以防止出现每秒时钟采样把播放器
-        // 反复推回某个倍速的情况。控速仅由反馈接口在状态变化时下发。
+        // 时钟轮询和反馈返回同一公共锚点及版本；非同步页面的独立控速仍
+        // 只通过反馈下发。客户端可据版本忽略较晚到达的旧响应。
         body = JSON.stringify({
           ...info,
+          sourceAlignmentDelayMs: this.alignmentDelayMs,
+          alignmentDelayMs: this.browserAlignmentDelayMs(info.synchronize === true),
+          sharedPlaybackClock: this.updateSharedPlaybackClock(info.synchronize === true, serverSendEpochMs),
+          playbackDiagnostics: this.playbackDiagnostics(),
           serverReceiveEpochMs,
           serverSendEpochMs,
           ...(Number.isFinite(clientSendPerfMs) ? { clientSendPerfMs } : {}),
@@ -1096,17 +1428,13 @@ export class QuicPullHub {
       writeHttpError(res, 410, 'Stream Ended');
       return;
     }
-    for (const frame of snapshot.frames) {
-      connection.push({
-        ordinal: frame.ordinal,
-        kind: frame.kind,
-        ptsUs: frame.ptsUs,
-        timelineUs: frame.timelineUs,
-        releaseEpochMs: frame.releaseEpochMs,
-        data: frame.data,
-      });
-      if (frame.ordinal > session.lastPolledOrdinal) {
-        session.lastPolledOrdinal = frame.ordinal;
+    connection.pushFrames(snapshot.frames);
+    // 仅首个连接用快照初始化共享轮询水位。新连接取得的较新快照不能推进
+    // 已有连接的水位，否则两次轮询之间到达的音视频只会交给新连接。
+    if (session.connections.size === 0) {
+      session.lastPolledOrdinal = 0;
+      for (const frame of snapshot.frames) {
+        session.lastPolledOrdinal = Math.max(session.lastPolledOrdinal, frame.ordinal);
       }
     }
     session.connections.add(connection);
