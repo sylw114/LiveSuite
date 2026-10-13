@@ -8,7 +8,7 @@ const {
   RAW_KEYFRAME,
   RAW_DELTA,
   RAW_AUDIO,
-} = require('../tscdist/main/quicPull');
+} = require('../tscdist/main/quicPull/index');
 
 async function openPlayer(port, streamPath) {
   const tags = [];

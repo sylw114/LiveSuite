@@ -13,7 +13,7 @@ const {
   SLOW_PLAYBACK_RATE,
   browserPlayerReleaseLeadMs,
   takeReadyFrames,
-} = require('../tscdist/main/quicPull');
+} = require('../tscdist/main/quicPull/index');
 
 const nowMs = 1_000_000;
 const alignmentDelayMs = 180;
@@ -182,14 +182,15 @@ assert.strictEqual(overbuffered.playbackRate, NORMAL_PLAYBACK_RATE + MAX_PLAYBAC
 assert.strictEqual(browserPlayerReleaseLeadMs(180), 180);
 assert.strictEqual(browserPlayerReleaseLeadMs(100), 100);
 assert.strictEqual(browserPlayerReleaseLeadMs(30), 30);
-const pullSource = fs.readFileSync('src/main/quicPull.ts', 'utf8');
+const sessionSource = fs.readFileSync('src/main/quicPull/session.ts', 'utf8');
 assert.match(
-  pullSource,
+  sessionSource,
   /const releaseLeadMs = this\.builtInBrowserPlayer[\s\S]*?browserPlayerReleaseLeadMs\(this\.session\.alignmentDelayMs\)/,
   'an existing browser connection must recalculate release lead after alignment changes',
 );
+const hubSource = fs.readFileSync('src/main/quicPull/hub.ts', 'utf8');
 assert.match(
-  pullSource,
+  hubSource,
   /session\.synchronized && !this\.alignmentReady[\s\S]*?Synchronizing media arrival/,
   'a synchronized browser must wait for measured audio/video arrival before starting',
 );

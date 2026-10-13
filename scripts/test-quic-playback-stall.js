@@ -1,5 +1,5 @@
 const assert = require('node:assert/strict');
-const { QuicPullHub } = require('../tscdist/main/quicPull');
+const { QuicPullHub } = require('../tscdist/main/quicPull/index');
 const { player, epochMs } = require('./test-browser-synchronized-audio');
 
 function withHub(run) {

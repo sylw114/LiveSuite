@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const { player, epochMs } = require('./test-browser-synchronized-audio');
-const { evaluateSharedPlaybackControl, QuicPullHub } = require('../tscdist/main/quicPull');
+const { evaluateSharedPlaybackControl, QuicPullHub } = require('../tscdist/main/quicPull/index');
 
 const mean = (values) => values.reduce((sum, value) => sum + value, 0) / values.length;
 const deviation = (values) => Math.sqrt(mean(values.map((value) => (value - mean(values)) ** 2)));

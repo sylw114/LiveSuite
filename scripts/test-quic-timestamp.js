@@ -1,5 +1,5 @@
 const assert = require('assert');
-const { wrapFlvTimestamp } = require('../tscdist/main/quicPull');
+const { wrapFlvTimestamp } = require('../tscdist/main/quicPull/index');
 
 const modulus = 0x1_0000_0000;
 assert.strictEqual(wrapFlvTimestamp(0), 0);

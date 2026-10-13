@@ -33,6 +33,13 @@ const LATENCY_P95_WINDOW_CADENCES: i64 = 20;
 /// 无感校速档一致，较大的错误预算能尽快收回，接近目标时又不会来回抖动。
 const ALIGNMENT_DECREASE_DIVISOR: u64 = 100;
 
+/// 音视频轨道标识，用于消除 video_/audio_ 对称方法的重复。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaTrack {
+    Video,
+    Audio,
+}
+
 #[derive(Clone, Debug)]
 pub struct OutputFrame {
     pub ordinal: u64,
@@ -60,6 +67,33 @@ struct StreamGopCache {
     audio_config: Option<OutputFrame>,
     gop: VecDeque<OutputFrame>,
     gop_bytes: usize,
+}
+
+impl StreamGopCache {
+    /// 将当前配置帧 + GOP 帧按媒体时间排序后组成快照。
+    fn snapshot(&self) -> Vec<OutputFrame> {
+        let mut snapshot = Vec::with_capacity(self.gop.len() + 2);
+        if let Some(config) = &self.video_config {
+            snapshot.push(config.clone());
+        }
+        if let Some(config) = &self.audio_config {
+            snapshot.push(config.clone());
+        }
+        let mut media: Vec<OutputFrame> = self.gop.iter().cloned().collect();
+        media.sort_by_key(|frame| (frame.media_time_us(), frame.ordinal));
+        snapshot.extend(media);
+        snapshot
+    }
+
+    /// 将帧追加到 GOP 缓存，超出预算时清空。
+    fn push_to_gop(&mut self, frame: &OutputFrame) {
+        self.gop_bytes = self.gop_bytes.saturating_add(frame.data.len());
+        self.gop.push_back(frame.clone());
+        if self.gop.len() > MAX_CACHED_GOP_FRAMES || self.gop_bytes > MAX_CACHED_GOP_BYTES {
+            self.gop.clear();
+            self.gop_bytes = 0;
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -211,7 +245,10 @@ impl FrameBuffer {
 
     /// 当前流观测到的端到端延迟 P95(毫秒)：取音视频两轨中较慢者，无样本时为 None。
     fn latency_p95_ms(&self) -> Option<i64> {
-        match (self.video_latency_profile(), self.audio_latency_profile()) {
+        match (
+            self.track_latency_profile(MediaTrack::Video),
+            self.track_latency_profile(MediaTrack::Audio),
+        ) {
             (Some(video), Some(audio)) => Some(video.p95_ms.max(audio.p95_ms)),
             (Some(video), None) => Some(video.p95_ms),
             (None, Some(audio)) => Some(audio.p95_ms),
@@ -219,54 +256,54 @@ impl FrameBuffer {
         }
     }
 
-    fn video_latency_profile(&self) -> Option<LatencyProfile> {
-        latency_profile(&self.video_latency_samples, 0)
+    fn track_samples(&self, track: MediaTrack) -> &Mutex<VecDeque<LatencySample>> {
+        match track {
+            MediaTrack::Video => &self.video_latency_samples,
+            MediaTrack::Audio => &self.audio_latency_samples,
+        }
     }
 
-    fn audio_latency_profile(&self) -> Option<LatencyProfile> {
-        latency_profile(
-            &self.audio_latency_samples,
-            self.audio_group_duration_us / 1000,
-        )
+    fn track_source_cadence_ms(&self, track: MediaTrack) -> i64 {
+        match track {
+            MediaTrack::Video => 0,
+            MediaTrack::Audio => self.audio_group_duration_us / 1000,
+        }
     }
 
-    fn video_latency_p95_ms(&self) -> Option<i64> {
-        self.video_latency_profile().map(|profile| profile.p95_ms)
+    fn track_calibrated_ref(&self, track: MediaTrack) -> &AtomicBool {
+        match track {
+            MediaTrack::Video => &self.video_alignment_calibrated,
+            MediaTrack::Audio => &self.audio_alignment_calibrated,
+        }
     }
 
-    fn audio_latency_p95_ms(&self) -> Option<i64> {
-        self.audio_latency_profile().map(|profile| profile.p95_ms)
+    fn track_latency_profile(&self, track: MediaTrack) -> Option<LatencyProfile> {
+        latency_profile(self.track_samples(track), self.track_source_cadence_ms(track))
     }
 
-    fn video_arrival_cadence_ms(&self) -> Option<i64> {
-        self.video_latency_profile()
-            .map(|profile| profile.cadence_ms)
+    fn track_latency_p95_ms(&self, track: MediaTrack) -> Option<i64> {
+        self.track_latency_profile(track).map(|profile| profile.p95_ms)
     }
 
-    fn audio_arrival_cadence_ms(&self) -> Option<i64> {
-        self.audio_latency_profile()
-            .map(|profile| profile.cadence_ms)
+    fn track_arrival_cadence_ms(&self, track: MediaTrack) -> Option<i64> {
+        self.track_latency_profile(track).map(|profile| profile.cadence_ms)
     }
 
     /// 预算只使用稳定 P95 一次，再加一路真实到达批次的 P95 间隔作为拉流、
     /// 解码和 FIFO 提前量。尾部异常不再通过 `P99 + (P99-P50)` 被重复放大；
     /// 对音频，cadence 至少是发送端上报的实际 PCM 采集组时长。
-    fn video_alignment_requirement(&self, current_ms: i64) -> Option<AlignmentRequirement> {
-        alignment_requirement(&self.video_latency_samples, current_ms, 0)
-    }
-
-    fn audio_alignment_requirement(&self, current_ms: i64) -> Option<AlignmentRequirement> {
+    fn track_alignment_requirement(&self, track: MediaTrack, current_ms: i64) -> Option<AlignmentRequirement> {
         alignment_requirement(
-            &self.audio_latency_samples,
+            self.track_samples(track),
             current_ms,
-            self.audio_group_duration_us / 1000,
+            self.track_source_cadence_ms(track),
         )
     }
 
     fn alignment_requirement(&self, current_ms: i64) -> Option<AlignmentRequirement> {
         match (
-            self.video_alignment_requirement(current_ms),
-            self.audio_alignment_requirement(current_ms),
+            self.track_alignment_requirement(MediaTrack::Video, current_ms),
+            self.track_alignment_requirement(MediaTrack::Audio, current_ms),
         ) {
             (Some(video), Some(audio)) if video.required_ms == audio.required_ms => {
                 Some(AlignmentRequirement {
@@ -297,17 +334,10 @@ impl FrameBuffer {
         // 四舍五入或最小 RTT 时钟模型可能让预测采集时刻领先本机约 1ms；
         // 物理到达延迟下界为零，不能因此永远卡住同步校准。
         let latency_ms = latency_ms.max(0);
-        let samples = if kind == RAW_AUDIO {
-            &self.audio_latency_samples
-        } else {
-            &self.video_latency_samples
-        };
+        let track = if kind == RAW_AUDIO { MediaTrack::Audio } else { MediaTrack::Video };
+        let samples = self.track_samples(track);
         let mut samples = samples.lock().expect("frame buffer latency lock poisoned");
-        let source_group_ms = if kind == RAW_AUDIO {
-            self.audio_group_duration_us / 1000
-        } else {
-            0
-        };
+        let source_group_ms = self.track_source_cadence_ms(track);
         push_latency_sample(
             &mut samples,
             LatencySample {
@@ -329,17 +359,10 @@ impl FrameBuffer {
         drop(samples);
 
         let current_ms = self.sync.sync_delay_ms.load(Ordering::Relaxed) as i64;
-        let requirement = if kind == RAW_AUDIO {
-            let requirement = self.audio_alignment_requirement(current_ms);
-            if requirement.is_some_and(|requirement| requirement.observation_complete) {
-                self.audio_alignment_calibrated
-                    .store(true, Ordering::Relaxed);
-            }
-            requirement
-        } else {
-            let requirement = self.video_alignment_requirement(current_ms);
-            if requirement.is_some_and(|requirement| requirement.observation_complete) {
-                self.video_alignment_calibrated
+        let requirement = {
+            let requirement = self.track_alignment_requirement(track, current_ms);
+            if requirement.is_some_and(|r| r.observation_complete) {
+                self.track_calibrated_ref(track)
                     .store(true, Ordering::Relaxed);
             }
             requirement
@@ -388,14 +411,7 @@ impl FrameBuffer {
             ring.cache.gop_bytes = 0;
         }
         if keyframe || !ring.cache.gop.is_empty() {
-            ring.cache.gop_bytes = ring.cache.gop_bytes.saturating_add(frame.data.len());
-            ring.cache.gop.push_back(frame.clone());
-            if ring.cache.gop.len() > MAX_CACHED_GOP_FRAMES
-                || ring.cache.gop_bytes > MAX_CACHED_GOP_BYTES
-            {
-                ring.cache.gop.clear();
-                ring.cache.gop_bytes = 0;
-            }
+            ring.cache.push_to_gop(&frame);
         }
         self.push_locked(&mut ring, frame);
     }
@@ -420,14 +436,7 @@ impl FrameBuffer {
         let frame = self.frame(RAW_AUDIO, pts_us, capture_epoch_ms, data);
         let mut ring = self.ring.lock().expect("frame buffer ring lock poisoned");
         if !ring.cache.gop.is_empty() {
-            ring.cache.gop_bytes = ring.cache.gop_bytes.saturating_add(frame.data.len());
-            ring.cache.gop.push_back(frame.clone());
-            if ring.cache.gop.len() > MAX_CACHED_GOP_FRAMES
-                || ring.cache.gop_bytes > MAX_CACHED_GOP_BYTES
-            {
-                ring.cache.gop.clear();
-                ring.cache.gop_bytes = 0;
-            }
+            ring.cache.push_to_gop(&frame);
         }
         self.push_locked(&mut ring, frame);
     }
@@ -523,32 +532,12 @@ impl FrameBuffer {
     pub fn take_frames(&self, after_ordinal: u64) -> (bool, bool, Vec<OutputFrame>) {
         let ring = self.ring.lock().expect("frame buffer ring lock poisoned");
         if after_ordinal == 0 {
-            let mut snapshot = Vec::with_capacity(ring.cache.gop.len() + 2);
-            if let Some(config) = &ring.cache.video_config {
-                snapshot.push(config.clone());
-            }
-            if let Some(config) = &ring.cache.audio_config {
-                snapshot.push(config.clone());
-            }
-            let mut media = ring.cache.gop.iter().cloned().collect::<Vec<_>>();
-            media.sort_by_key(|frame| (frame.media_time_us(), frame.ordinal));
-            snapshot.extend(media);
-            return (false, ring.closed, snapshot);
+            return (false, ring.closed, ring.cache.snapshot());
         }
 
         if let Some(first) = ring.frames.front() {
             if after_ordinal < first.ordinal {
-                let mut snapshot = Vec::with_capacity(ring.cache.gop.len() + 2);
-                if let Some(config) = &ring.cache.video_config {
-                    snapshot.push(config.clone());
-                }
-                if let Some(config) = &ring.cache.audio_config {
-                    snapshot.push(config.clone());
-                }
-                let mut media = ring.cache.gop.iter().cloned().collect::<Vec<_>>();
-                media.sort_by_key(|frame| (frame.media_time_us(), frame.ordinal));
-                snapshot.extend(media);
-                return (true, ring.closed, snapshot);
+                return (true, ring.closed, ring.cache.snapshot());
             }
         }
 
@@ -677,10 +666,10 @@ impl FrameHub {
                     "path": buffer.stream_path,
                     "originServerMs": buffer.origin_server_ms().unwrap_or(0),
                     "latencyP95Ms": buffer.latency_p95_ms().unwrap_or(0),
-                    "videoLatencyP95Ms": buffer.video_latency_p95_ms().unwrap_or(0),
-                    "audioLatencyP95Ms": buffer.audio_latency_p95_ms().unwrap_or(0),
-                    "videoArrivalCadenceP95Ms": buffer.video_arrival_cadence_ms().unwrap_or(0),
-                    "audioArrivalCadenceP95Ms": buffer.audio_arrival_cadence_ms().unwrap_or(0),
+                    "videoLatencyP95Ms": buffer.track_latency_p95_ms(MediaTrack::Video).unwrap_or(0),
+                    "audioLatencyP95Ms": buffer.track_latency_p95_ms(MediaTrack::Audio).unwrap_or(0),
+                    "videoArrivalCadenceP95Ms": buffer.track_arrival_cadence_ms(MediaTrack::Video).unwrap_or(0),
+                    "audioArrivalCadenceP95Ms": buffer.track_arrival_cadence_ms(MediaTrack::Audio).unwrap_or(0),
                     "audioGroupDurationMs": buffer.audio_group_duration_us / 1000,
                     "alignmentReady": buffer.alignment_ready(),
                 }));

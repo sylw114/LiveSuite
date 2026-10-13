@@ -14,7 +14,7 @@ import {
   QuicFrameSource,
   QuicPullHub,
   TakeFramesResult,
-} from './quicPull';
+} from './quicPull/index';
 
 export interface LiveSuiteQuicServerOptions {
   /** `.node` addon 绝对路径(替代原 binaryPath)。 */

@@ -1799,6 +1799,23 @@
         this.presentationOffsetMs = 0;
       }
 
+      // 重置播放时间轴和帧率控制状态。resetPipeline / resetForRealignment
+      // 共用此核心子集；各自的额外清理（配置、对齐预算等）在外层完成。
+      resetPlaybackTimeline(reason) {
+        this.waitingForKeyframe = true;
+        this.mediaBaseUs = null;
+        this.startPerfMs = null;
+        this.lastInputPtsUs = null;
+        this.lastDisplayedPtsUs = null;
+        this.frameRateCapacityEstimateFps = this.preferredVideoFps;
+        this.frameRateStableSamples = 0;
+        this.frameRateLimitedSamples = 0;
+        this.lastFrameRateAchievement = 1;
+        this.lastFrameRateControlReason = reason;
+        this.resetPresentationPhase();
+        if (this.context) this.context.clearRect(0, 0, this.canvas.width, this.canvas.height);
+      }
+
       resetPipeline() {
         this.closeVideoDecoder();
         this.closeAudioDecoder();
@@ -1811,21 +1828,10 @@
         this.videoConfigKey = '';
         this.audioConfig = null;
         this.audioConfigKey = '';
-        this.waitingForKeyframe = true;
-        this.mediaBaseUs = null;
-        this.startPerfMs = null;
-        this.lastInputPtsUs = null;
-        this.lastDisplayedPtsUs = null;
         this.nextVideoPresentationMs = null;
         this.lastVideoPresentationMs = null;
         this.displayLagMs = 0;
-        this.frameRateCapacityEstimateFps = this.preferredVideoFps;
-        this.frameRateStableSamples = 0;
-        this.frameRateLimitedSamples = 0;
-        this.lastFrameRateAchievement = 1;
-        this.lastFrameRateControlReason = 'pipeline-reset';
-        this.resetPresentationPhase();
-        if (this.context) this.context.clearRect(0, 0, this.canvas.width, this.canvas.height);
+        this.resetPlaybackTimeline('pipeline-reset');
       }
 
       // 压缩视频队列上限随显示延迟增长：latent 只是把帧留在队列里等待按需
@@ -1890,9 +1896,15 @@
         if (performance.now() - this.lastVideoOutputAt < 1000) return;
 
         setStatus('视频解码器停滞，正在重建…', true);
-        const videoConfig = this.videoConfig;
+        this.rebuildVideoDecoder();
+      }
+
+      // 关闭当前视频解码器并立即用现有配置重建，等待下一个关键帧。
+      // enqueueVideo 溢出、时间戳回退、停滞恢复等多处共用此模式。
+      rebuildVideoDecoder() {
+        const config = this.videoConfig;
         this.closeVideoDecoder();
-        if (videoConfig) this.configureVideo(videoConfig);
+        if (config) this.configureVideo(config);
       }
 
       audioDecoderStallThresholdMs() {
@@ -2746,10 +2758,8 @@
         this.videoDegradedSamples = 0;
         this.videoPipelineRecoveries++;
         setStatus('视频解码管线持续积压，正在等待关键帧恢复…', true);
-        const videoConfig = this.videoConfig;
-        this.closeVideoDecoder();
         this.waitingForKeyframe = true;
-        if (videoConfig) this.configureVideo(videoConfig);
+        this.rebuildVideoDecoder();
       }
 
       resetForRealignment() {
@@ -2763,18 +2773,7 @@
         this.videoLeadDeficitSince = null;
         this.videoLeadDeficitWindowMs = 0;
         this.setPlaybackRate(1);
-        this.waitingForKeyframe = true;
-        this.mediaBaseUs = null;
-        this.startPerfMs = null;
-        this.lastInputPtsUs = null;
-        this.lastDisplayedPtsUs = null;
-        this.frameRateCapacityEstimateFps = this.preferredVideoFps;
-        this.frameRateStableSamples = 0;
-        this.frameRateLimitedSamples = 0;
-        this.lastFrameRateAchievement = 1;
-        this.lastFrameRateControlReason = 'realignment-reset';
-        this.resetPresentationPhase();
-        if (this.context) this.context.clearRect(0, 0, this.canvas.width, this.canvas.height);
+        this.resetPlaybackTimeline('realignment-reset');
         setStatus('正在重新对齐播放器时钟…');
       }
 
@@ -2798,14 +2797,7 @@
           this.startPerfMs = performance.now() + playbackLatencyMs() + this.adaptiveLatentMs;
         }
         this.resetPresentationPhase();
-        this.audioArrivalLeadMs = null;
-        this.audioArrivalLeadObservedAt = 0;
-        this.audioArrivalGroupAnchorUs = null;
-        this.audioArrivalGroupIndex = null;
-        this.audioArrivalGroupMinLeadMs = null;
-        this.audioArrivalGroupMinLeadObservedAt = 0;
-        this.adaptiveLatentDeficitSince = null;
-        this.adaptiveLatentDeficitWindowMs = 0;
+        this.resetAlignmentEvidence();
         // 音频配置往往会先于第一张关键帧到达。时间轴一旦建立，立即消费此前
         // 保留的压缩音频，而不是让这些输出在 mediaBaseUs 为 null 时被丢弃。
         this.resetAudioTimeline('timeline-established');
@@ -2908,8 +2900,7 @@
           }
           this.videoInput = [];
           this.videoInputBytes = 0;
-          this.closeVideoDecoder();
-          if (this.videoConfig) this.configureVideo(this.videoConfig);
+          this.rebuildVideoDecoder();
           this.mediaBaseUs = null;
           this.startPerfMs = null;
           if (!this.establishTimeline(timestampUs)) {
@@ -2920,8 +2911,7 @@
 
         if (this.lastInputPtsUs !== null && timestampUs + 1000000 < this.lastInputPtsUs) {
           if (!key) return;
-          this.closeVideoDecoder();
-          if (this.videoConfig) this.configureVideo(this.videoConfig);
+          this.rebuildVideoDecoder();
           this.mediaBaseUs = null;
           this.startPerfMs = null;
           this.lastInputPtsUs = timestampUs;
@@ -2943,8 +2933,7 @@
           }
           this.videoInput = [];
           this.videoInputBytes = 0;
-          this.closeVideoDecoder();
-          if (this.videoConfig) this.configureVideo(this.videoConfig);
+          this.rebuildVideoDecoder();
         }
         this.videoInput.push({ timestampUs, key, data: data.slice() });
         this.videoInputBytes += data.byteLength;

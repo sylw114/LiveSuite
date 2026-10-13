@@ -75,7 +75,7 @@ assert.ok(html.includes('createScriptProcessorOutput(') && html.includes("'proce
 assert.ok(html.includes("pageParams.get('audioout')"), 'audioout=script must force the fallback output');
 assert.ok(!feedback.includes('audioSources'), 'audio node watermarks no longer exist');
 const videoRecovery = method('recoverDegradedVideoPipeline()', '\n      resetForRealignment() {');
-assert.match(videoRecovery, /this\.closeVideoDecoder\(\)/);
+assert.match(videoRecovery, /this\.rebuildVideoDecoder\(\)/);
 assert.ok(!/closeAudioDecoder|resetAudioTimeline|abortController/.test(videoRecovery),
   'video backlog recovery must not interrupt already queued audio');
 const metrics = method('playbackMetrics()', '\n      async sendPlaybackFeedback() {');

@@ -35,3 +35,6 @@ AGENTS.md
 CLAUDE.md
 .claude/
 .atomcode/
+
+.mcp.json
+.agents/
